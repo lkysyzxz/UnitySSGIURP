@@ -62,54 +62,66 @@ Shader "Hidden/SSR/ScreenSpaceReflection"
                 // Reflected ray heading to z<0 goes back towards the camera — skip it.
                 if (rayDir.z < 0.0) return SAMPLE_TEXTURE2D_X(_BlitTexture, sampler_LinearClamp, uv);
 
-                // 4. Ray march in view space
-                float3 rayPos = viewPos;
-                float stepSize = _SSRStepSize;
-                float3 hitColor = float3(0, 0, 0);
-                bool hit = false;
-                
+                // 4. 屏幕空间 DDA Ray March
+                //    在 view space 算起点/终点，投影到屏幕 UV，再用 DDA 在 UV 空间均匀划线步进。
+                //    步数由屏幕跨度决定（而非固定步长），屏幕采样分布更均匀。
+
+                // 4.1 起点和终点（view space，正 Z 约定）
+                float3 rayStartVS = viewPos;
+                float3 rayEndVS   = viewPos + rayDir * _SSRMaxDistance;
+
+                // 4.2 投影到屏幕 UV（-Z 因为 UNITY_MATRIX_P 期望负 Z）
+                float4 startClip = mul(UNITY_MATRIX_P, float4(rayStartVS.xy, -rayStartVS.z, 1.0));
+                float2 startUV = (startClip.xy / startClip.w) * 0.5 + 0.5;
+               
+
+                float4 endClip = mul(UNITY_MATRIX_P, float4(rayEndVS.xy, -rayEndVS.z, 1.0));
+                float2 endUV   = (endClip.xy / endClip.w) * 0.5 + 0.5;
+
+                // 4.3 DDA 步数：UV 跨度按各轴对应的屏幕分辨率转成像素，取主轴像素跨度
+                float2 deltaUV      = endUV - startUV;
+                float2 deltaPixel   = deltaUV * _ScreenParams.xy;  // x 乘宽、y 乘高，各自对齐
+                float  maxPixelSpan = max(abs(deltaPixel.x), abs(deltaPixel.y));
+                int    numSteps     = (int)clamp(maxPixelSpan, 1.0, (float)_SSRMaxSteps);
+
+                // 4.4 每步增量：UV 线性步进 + 1/z 线性插值（透视正确）
+                //     3D 直线投影后仍是屏幕直线，沿该直线 1/z 线性变化。
+                //     所以 UV 线性步进时插值 1/z，再取倒数得到射线深度，和 currentUV 精确对齐。
+                float  invZ0     = 1.0 / rayStartVS.z;
+                float  invZ1     = 1.0 / rayEndVS.z;
+                float2 stepUV    = deltaUV / (float)numSteps;
+                float  invZStep  = (invZ1 - invZ0) / (float)numSteps;
+
+                // 4.5 DDA 步进
+                float2 currentUV   = startUV;
+                float  currentInvZ = invZ0;
+                float3 hitColor    = float3(0, 0, 0);
+                bool    hit        = false;
+
                 [loop]
-                for (int i = 0; i < _SSRMaxSteps; i++)
+                for (int i = 0; i < numSteps; i++)
                 {
-                    // Advance ray
-                    rayPos += rayDir * stepSize;
+                    currentUV += stepUV;
+                    currentInvZ += invZStep;
 
-                    // Clamp ray travel distance
-                    // if (length(rayPos - viewPos) > _SSRMaxDistance)
-                    //     break;
-
-                    // Project view-space position to UV.
-                    // We use positive-Z internally, but UNITY_MATRIX_P expects negative Z
-                    // for points in front of the camera. Negate Z here so clip.w comes
-                    // out positive (otherwise the NDC x/y get flipped -> mirror reflection).
-                    float4 clipPos = mul(UNITY_MATRIX_P, float4(rayPos.xy, -rayPos.z, 1.0));
-                    float2 rayUV = clipPos.xy / clipPos.w;
-                    rayUV = rayUV * 0.5 + 0.5; // NDC [-1,1] -> UV [0,1]
-
-                    // Check if ray went off screen
-                    if (rayUV.x < 0.0 || rayUV.x > 1.0 || rayUV.y < 0.0 || rayUV.y > 1.0)
+                    // 超出图像边界则停止
+                    if (currentUV.x < 0.0 || currentUV.x > 1.0 ||
+                        currentUV.y < 0.0 || currentUV.y > 1.0)
                         break;
 
-                    // Sample depth at ray UV and reconstruct scene view position
-                    float sceneDepth = SampleSceneDepth(rayUV);
-                    float3 sceneViewPos = ComputeViewSpacePosition(rayUV, sceneDepth);
+                    // 当前射线的透视正确深度（1/(1/z) 还原）
+                    float currentRayZ = 1.0 / currentInvZ;
 
-                    // Depth comparison (positive-Z convention: larger z = further from camera).
-                    // rayPos.z > sceneViewPos.z => ray is further than scene geometry => behind it.
-                    float depthDiff = rayPos.z - sceneViewPos.z;
+                    // 场景深度（正 Z）—— 直接用 LinearEyeDepth，省去 xy 重建
+                    float sceneDepth = SampleSceneDepth(currentUV);
+                    float sceneZ = LinearEyeDepth(sceneDepth, _ZBufferParams);
+
+                    // 命中检测：射线已穿到几何体后方，且在厚度容差内
+                    float depthDiff = currentRayZ - sceneZ;
                     if (depthDiff > 0.0 && abs(depthDiff) < _SSRThickness)
                     {
-                        // HIT - sample the opaque color at hit UV
-                        hitColor = SampleSceneColor(rayUV);
+                        hitColor = SampleSceneColor(currentUV);
                         hit = true;
-
-                        // // Fade based on iteration count (early hits are more reliable)
-                        // float iterationFade = 1.0 - (float)i / (float)_SSRMaxSteps;
-                        // // Fade based on edge proximity
-                        // float2 edgeFade = smoothstep(0.0, 0.1, rayUV) * smoothstep(0.0, 0.1, 1.0 - rayUV);
-                        // float edgeFadeFactor = edgeFade.x * edgeFade.y;
-                        //
-                        // hitColor *= iterationFade * edgeFadeFactor;
                         break;
                     }
                 }
