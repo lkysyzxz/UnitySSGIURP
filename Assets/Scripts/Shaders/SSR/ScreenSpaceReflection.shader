@@ -28,108 +28,215 @@ Shader "Hidden/SSR/ScreenSpaceReflection"
             #include "Packages/com.unity.render-pipelines.universal/ShaderLibrary/DeclareOpaqueTexture.hlsl"
             #include "../GI/Commond.hlsl"
 
-            float _SSRStepSize;
             float _SSRMaxDistance;
-            int _SSRMaxSteps;
+            int   _SSRMaxSteps;
             float _SSRThickness;
 
-            float4 ScreenSpaceReflectionFrag(Varyings input) : SV_Target
+            #define SSR_BINARY_STEPS 10
+
+            // ===== SSR 命中结果 =====
+            struct SSRHit
             {
-                float2 uv = input.texcoord;
+                bool   hit;
+                float2 hitUV;
+                float3 color;
+            };
 
-                // 1. Sample depth and reconstruct view-space position
-                float rawDepth = SampleSceneDepth(uv);
-                #if UNITY_REVERSED_Z
-                    if (rawDepth == 1.0) return SAMPLE_TEXTURE2D_X(_BlitTexture, sampler_LinearClamp, uv); // sky pixel
-                #else
-                    if (rawDepth == 0.0) return SAMPLE_TEXTURE2D_X(_BlitTexture, sampler_LinearClamp, uv);
-                #endif
+            // ===== 辅助：view space 位置（正 Z 约定）投影到屏幕 UV =====
+            // UNITY_MATRIX_P 期望负 Z，这里取反后投影
+            float2 ProjectVStoUV(float3 vsPos)
+            {
+                float4 clip = mul(UNITY_MATRIX_P, float4(vsPos.xy, -vsPos.z, 1.0));
+                return (clip.xy / clip.w) * 0.5 + 0.5;
+            }
 
-                // ComputeViewSpacePosition returns Z = +linearEyeDepth (positive).
-                // We KEEP this positive-Z convention internally for ray marching (it is
-                // self-consistent). Only the projection step needs special handling,
-                // because UNITY_MATRIX_P expects negative Z for points in front of camera.
-                float3 viewPos = ComputeViewSpacePosition(uv, rawDepth);
+            // ===== 方法一：DDA 直接命中 =====
+            // 屏幕 UV 空间均匀步进（每步约 1 像素），每步做厚度测试。
+            SSRHit SSRMarchDDA(float3 rayStartVS, float3 rayEndVS, int maxSteps, float thickness)
+            {
+                SSRHit result = (SSRHit)0;
 
-                // 2. Compute view-space normal from position derivatives
-                float3 normal = GetNormalFromPosition(viewPos);
+                float2 startUV = ProjectVStoUV(rayStartVS);
+                float2 endUV   = ProjectVStoUV(rayEndVS);
 
-                // 3. Compute reflected ray direction in view space
-                float3 viewDir = normalize(viewPos);
-                float3 rayDir = reflect(viewDir, normal);
-
-                // Positive-Z convention: scene is at z>0, camera at z=0.
-                // Reflected ray heading to z<0 goes back towards the camera — skip it.
-                if (rayDir.z < 0.0) return SAMPLE_TEXTURE2D_X(_BlitTexture, sampler_LinearClamp, uv);
-
-                // 4. 屏幕空间 DDA Ray March
-                //    在 view space 算起点/终点，投影到屏幕 UV，再用 DDA 在 UV 空间均匀划线步进。
-                //    步数由屏幕跨度决定（而非固定步长），屏幕采样分布更均匀。
-
-                // 4.1 起点和终点（view space，正 Z 约定）
-                float3 rayStartVS = viewPos;
-                float3 rayEndVS   = viewPos + rayDir * _SSRMaxDistance;
-
-                // 4.2 投影到屏幕 UV（-Z 因为 UNITY_MATRIX_P 期望负 Z）
-                float4 startClip = mul(UNITY_MATRIX_P, float4(rayStartVS.xy, -rayStartVS.z, 1.0));
-                float2 startUV = (startClip.xy / startClip.w) * 0.5 + 0.5;
-               
-
-                float4 endClip = mul(UNITY_MATRIX_P, float4(rayEndVS.xy, -rayEndVS.z, 1.0));
-                float2 endUV   = (endClip.xy / endClip.w) * 0.5 + 0.5;
-
-                // 4.3 DDA 步数：UV 跨度按各轴对应的屏幕分辨率转成像素，取主轴像素跨度
+                // DDA 步数：各轴按对应分辨率转像素，取主轴跨度
                 float2 deltaUV      = endUV - startUV;
-                float2 deltaPixel   = deltaUV * _ScreenParams.xy;  // x 乘宽、y 乘高，各自对齐
+                float2 deltaPixel   = deltaUV * _ScreenParams.xy;
                 float  maxPixelSpan = max(abs(deltaPixel.x), abs(deltaPixel.y));
-                int    numSteps     = (int)clamp(maxPixelSpan, 1.0, (float)_SSRMaxSteps);
+                int    numSteps     = (int)clamp(maxPixelSpan, 1.0, (float)maxSteps);
 
-                // 4.4 每步增量：UV 线性步进 + 1/z 线性插值（透视正确）
-                //     3D 直线投影后仍是屏幕直线，沿该直线 1/z 线性变化。
-                //     所以 UV 线性步进时插值 1/z，再取倒数得到射线深度，和 currentUV 精确对齐。
-                float  invZ0     = 1.0 / rayStartVS.z;
-                float  invZ1     = 1.0 / rayEndVS.z;
-                float2 stepUV    = deltaUV / (float)numSteps;
-                float  invZStep  = (invZ1 - invZ0) / (float)numSteps;
+                // 1/z 透视正确插值（屏幕空间步进下 z 非线性，1/z 才线性）
+                float  invZ0    = 1.0 / rayStartVS.z;
+                float  invZ1    = 1.0 / rayEndVS.z;
+                float2 stepUV   = deltaUV / (float)numSteps;
+                float  invZStep = (invZ1 - invZ0) / (float)numSteps;
 
-                // 4.5 DDA 步进
                 float2 currentUV   = startUV;
                 float  currentInvZ = invZ0;
-                float3 hitColor    = float3(0, 0, 0);
-                bool    hit        = false;
 
                 [loop]
                 for (int i = 0; i < numSteps; i++)
                 {
-                    currentUV += stepUV;
+                    currentUV   += stepUV;
                     currentInvZ += invZStep;
 
-                    // 超出图像边界则停止
+                    // 出屏停止
                     if (currentUV.x < 0.0 || currentUV.x > 1.0 ||
                         currentUV.y < 0.0 || currentUV.y > 1.0)
                         break;
 
-                    // 当前射线的透视正确深度（1/(1/z) 还原）
                     float currentRayZ = 1.0 / currentInvZ;
+                    float sceneZ = LinearEyeDepth(SampleSceneDepth(currentUV), _ZBufferParams);
 
-                    // 场景深度（正 Z）—— 直接用 LinearEyeDepth，省去 xy 重建
-                    float sceneDepth = SampleSceneDepth(currentUV);
-                    float sceneZ = LinearEyeDepth(sceneDepth, _ZBufferParams);
-
-                    // 命中检测：射线已穿到几何体后方，且在厚度容差内
+                    // 厚度测试：射线穿到几何体后方，且在容差内
                     float depthDiff = currentRayZ - sceneZ;
-                    if (depthDiff > 0.0 && abs(depthDiff) < _SSRThickness)
+                    if (depthDiff > 0.0 && abs(depthDiff) < thickness)
                     {
-                        hitColor = SampleSceneColor(currentUV);
-                        hit = true;
+                        result.hit   = true;
+                        result.hitUV = currentUV;
+                        result.color = SampleSceneColor(currentUV);
                         break;
                     }
                 }
-                // 5. Composite: blend reflected color with original
-                float4 originalColor = SAMPLE_TEXTURE2D_X(_BlitTexture, sampler_LinearClamp, uv);
-                if (hit)
+
+                return result;
+            }
+
+            // ===== 方法二：DDA 粗步进 + 二分细化 =====
+            // Phase 1：粗步进找射线第一次穿到几何体后方（rayZ > sceneZ）的跨越点
+            // Phase 2：在跨越区间 [lo(前方), hi(后方)] 内二分缩窄，精确锁定命中点
+            SSRHit SSRMarchBinary(float3 rayStartVS, float3 rayEndVS,
+                                  int maxSteps, float thickness, int binarySteps)
+            {
+                SSRHit result = (SSRHit)0;
+
+                float2 startUV = ProjectVStoUV(rayStartVS);
+                float2 endUV   = ProjectVStoUV(rayEndVS);
+
+                float2 deltaUV      = endUV - startUV;
+                float2 deltaPixel   = deltaUV * _ScreenParams.xy;
+                float  maxPixelSpan = max(abs(deltaPixel.x), abs(deltaPixel.y));
+                int    numSteps     = (int)clamp(maxPixelSpan, 1.0, (float)maxSteps);
+
+                float  invZ0    = 1.0 / rayStartVS.z;
+                float  invZ1    = 1.0 / rayEndVS.z;
+                float2 stepUV   = deltaUV / (float)numSteps;
+                float  invZStep = (invZ1 - invZ0) / (float)numSteps;
+
+                // --- Phase 1: 粗步进，找射线第一次穿到几何体后方 ---
+                float2 prevUV      = startUV;
+                float  prevInvZ    = invZ0;
+                float2 currentUV   = startUV;
+                float  currentInvZ = invZ0;
+                bool   crossed     = false;
+
+                [loop]
+                for (int i = 0; i < numSteps; i++)
                 {
-                    return float4(lerp(originalColor,hitColor,0.5f), 1);
+                    prevUV       = currentUV;
+                    prevInvZ     = currentInvZ;
+                    currentUV   += stepUV;
+                    currentInvZ += invZStep;
+
+                    if (currentUV.x < 0.0 || currentUV.x > 1.0 ||
+                        currentUV.y < 0.0 || currentUV.y > 1.0)
+                        break;
+
+                    float currentRayZ = 1.0 / currentInvZ;
+                    float sceneZ = LinearEyeDepth(SampleSceneDepth(currentUV), _ZBufferParams);
+
+                    if (currentRayZ > sceneZ)   // 射线穿到后方
+                    {
+                        crossed = true;
+                        break;
+                    }
+                }
+
+                if (!crossed)
+                    return result;   // 全程没碰到几何体
+
+                // --- Phase 2: 二分细化 ---
+                // lo: 射线在表面前方 (rayZ <= sceneZ) —— 跨越前的最后位置
+                // hi: 射线在表面后方 (rayZ >  sceneZ) —— 跨越后的第一个位置
+                float2 loUV   = prevUV;
+                float  loInvZ = prevInvZ;
+                float2 hiUV   = currentUV;
+                float  hiInvZ = currentInvZ;
+
+                [loop]
+                for (int j = 0; j < binarySteps; j++)
+                {
+                    float2 midUV     = (loUV + hiUV) * 0.5;
+                    float  midInvZ   = (loInvZ + hiInvZ) * 0.5;
+                    float  midRayZ   = 1.0 / midInvZ;
+                    float  midSceneZ = LinearEyeDepth(SampleSceneDepth(midUV), _ZBufferParams);
+
+                    if (midRayZ > midSceneZ)
+                    {
+                        // 中点在后方 → 命中点在 [lo, mid]
+                        hiUV   = midUV;
+                        hiInvZ = midInvZ;
+                    }
+                    else
+                    {
+                        // 中点在前方 → 命中点在 [mid, hi]
+                        loUV   = midUV;
+                        loInvZ = midInvZ;
+                    }
+                }
+
+                // 二分收敛，hi 是射线从后方逼近表面的位置；做最终厚度确认
+                // （排除射线跨过缝隙/厚墙的情况：收敛后若穿透仍很深，判为未命中）
+                float finalRayZ   = 1.0 / hiInvZ;
+                float finalSceneZ = LinearEyeDepth(SampleSceneDepth(hiUV), _ZBufferParams);
+                float depthDiff   = finalRayZ - finalSceneZ;
+
+                if (depthDiff > 0.0 && abs(depthDiff) < thickness)
+                {
+                    result.hit   = true;
+                    result.hitUV = hiUV;
+                    result.color = SampleSceneColor(hiUV);
+                }
+
+                return result;
+            }
+
+            // ===== Fragment =====
+            float4 ScreenSpaceReflectionFrag(Varyings input) : SV_Target
+            {
+                float2 uv = input.texcoord;
+
+                // 1. 采样深度，重建观察空间位置
+                float rawDepth = SampleSceneDepth(uv);
+                #if UNITY_REVERSED_Z
+                    if (rawDepth == 1.0) return SAMPLE_TEXTURE2D_X(_BlitTexture, sampler_LinearClamp, uv); // sky
+                #else
+                    if (rawDepth == 0.0) return SAMPLE_TEXTURE2D_X(_BlitTexture, sampler_LinearClamp, uv);
+                #endif
+
+                float3 viewPos = ComputeViewSpacePosition(uv, rawDepth);
+
+                // 2. 法线 & 反射方向
+                float3 normal  = GetNormalFromPosition(viewPos);
+                float3 viewDir = normalize(viewPos);
+                float3 rayDir  = reflect(viewDir, normal);
+
+                // 正 Z 约定：射线 z<0 朝相机，无可反射内容
+                if (rayDir.z < 0.0) return SAMPLE_TEXTURE2D_X(_BlitTexture, sampler_LinearClamp, uv);
+
+                // 3. 射线起终点
+                float3 rayStartVS = viewPos;
+                float3 rayEndVS   = viewPos + rayDir * _SSRMaxDistance;
+
+                // 4. Ray March —— 切换方法只需换这一行
+                SSRHit hit = SSRMarchBinary(rayStartVS, rayEndVS, _SSRMaxSteps, _SSRThickness, SSR_BINARY_STEPS);
+                // SSRHit hit = SSRMarchDDA(rayStartVS, rayEndVS, _SSRMaxSteps, _SSRThickness);
+
+                // 5. 合成
+                float4 originalColor = SAMPLE_TEXTURE2D_X(_BlitTexture, sampler_LinearClamp, uv);
+                if (hit.hit)
+                {
+                    return float4(lerp(originalColor.rgb, hit.color, 0.5f), 1.0);
                 }
                 return originalColor;
             }

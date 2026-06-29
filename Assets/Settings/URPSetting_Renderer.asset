@@ -70,8 +70,8 @@ MonoBehaviour:
   m_EditorClassIdentifier: 
   m_Active: 1
   settings:
-    stepSize: 0.01
+    stepSize: 0.963
     maxSteps: 1024
     maxDistance: 1024
-    thickness: 0.05
+    thickness: 0.04
   ssrShader: {fileID: 4800000, guid: 49c2967c37eaa4f4788a2015ab1fa0b8, type: 3}
