@@ -17,7 +17,8 @@ MonoBehaviour:
     hdrDebugViewPS: {fileID: 4800000, guid: 573620ae32aec764abd4d728906d2587, type: 3}
   m_RendererFeatures:
   - {fileID: 2154634942030312675}
-  m_RendererFeatureMap: e3745c6410cde61d
+  - {fileID: 8235197496059556877}
+  m_RendererFeatureMap: e3745c6410cde61d0df4d09f7d4c4972
   m_UseNativeRenderPass: 0
   postProcessData: {fileID: 11400000, guid: 41439944d30ece34e96484bdb6645b55, type: 2}
   xrSystemData: {fileID: 11400000, guid: 60e1133243b97e347b653163a8c01b64, type: 2}
@@ -70,8 +71,25 @@ MonoBehaviour:
   m_EditorClassIdentifier: 
   m_Active: 1
   settings:
-    stepSize: 0.963
     maxSteps: 1024
-    maxDistance: 1024
-    thickness: 0.04
+    maxDistance: 569
+    thickness: 0.08
+    blurSpread: 1.75
+    jitterDither: 1
   ssrShader: {fileID: 4800000, guid: 49c2967c37eaa4f4788a2015ab1fa0b8, type: 3}
+--- !u!114 &8235197496059556877
+MonoBehaviour:
+  m_ObjectHideFlags: 0
+  m_CorrespondingSourceObject: {fileID: 0}
+  m_PrefabInstance: {fileID: 0}
+  m_PrefabAsset: {fileID: 0}
+  m_GameObject: {fileID: 0}
+  m_Enabled: 1
+  m_EditorHideFlags: 0
+  m_Script: {fileID: 11500000, guid: 4205707d9845bb043870660c4ba95894, type: 3}
+  m_Name: HierarchicalZBufferFeature
+  m_EditorClassIdentifier: 
+  m_Active: 1
+  settings:
+    mipCount: 4
+  hiZShader: {fileID: 4800000, guid: 2bce8fb6a27df734890b9bc6bacee59f, type: 3}
