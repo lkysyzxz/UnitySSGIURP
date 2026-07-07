@@ -69,12 +69,12 @@ MonoBehaviour:
   m_Script: {fileID: 11500000, guid: 23e33a9265fc4b64790ed47a886590d4, type: 3}
   m_Name: ScreenSpaceReflectionFeature
   m_EditorClassIdentifier: 
-  m_Active: 1
+  m_Active: 0
   settings:
     maxSteps: 1024
     maxDistance: 569
     thickness: 0.08
-    blurSpread: 1.75
+    blurSpread: 1.82
     jitterDither: 1
   ssrShader: {fileID: 4800000, guid: 49c2967c37eaa4f4788a2015ab1fa0b8, type: 3}
 --- !u!114 &8235197496059556877
@@ -89,7 +89,7 @@ MonoBehaviour:
   m_Script: {fileID: 11500000, guid: 4205707d9845bb043870660c4ba95894, type: 3}
   m_Name: HierarchicalZBufferFeature
   m_EditorClassIdentifier: 
-  m_Active: 1
+  m_Active: 0
   settings:
     mipCount: 4
   hiZShader: {fileID: 4800000, guid: 2bce8fb6a27df734890b9bc6bacee59f, type: 3}
