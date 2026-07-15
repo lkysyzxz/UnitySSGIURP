@@ -18,7 +18,8 @@ MonoBehaviour:
   m_RendererFeatures:
   - {fileID: 2154634942030312675}
   - {fileID: 8235197496059556877}
-  m_RendererFeatureMap: e3745c6410cde61d0df4d09f7d4c4972
+  - {fileID: 4306748369461729667}
+  m_RendererFeatureMap: e3745c6410cde61d0df4d09f7d4c49728359c2ead2a4c43b
   m_UseNativeRenderPass: 0
   postProcessData: {fileID: 11400000, guid: 41439944d30ece34e96484bdb6645b55, type: 2}
   xrSystemData: {fileID: 11400000, guid: 60e1133243b97e347b653163a8c01b64, type: 2}
@@ -77,6 +78,34 @@ MonoBehaviour:
     blurSpread: 1.82
     jitterDither: 1
   ssrShader: {fileID: 4800000, guid: 49c2967c37eaa4f4788a2015ab1fa0b8, type: 3}
+--- !u!114 &4306748369461729667
+MonoBehaviour:
+  m_ObjectHideFlags: 0
+  m_CorrespondingSourceObject: {fileID: 0}
+  m_PrefabInstance: {fileID: 0}
+  m_PrefabAsset: {fileID: 0}
+  m_GameObject: {fileID: 0}
+  m_Enabled: 1
+  m_EditorHideFlags: 0
+  m_Script: {fileID: 11500000, guid: f6b8d2d2248146da8062ccd85f1e189a, type: 3}
+  m_Name: ScreenSpaceGlobalIlluminationFeature
+  m_EditorClassIdentifier: 
+  m_Active: 1
+  settings:
+    rayCount: 1
+    sampleOffset: 0
+    maxSteps: 256
+    maxDistance: 1024
+    thickness: 0.1
+    originBias: 0
+    useHiZTracing: 0
+    intensity: 1
+    maxBlend: 1
+    blurSpread: 1.2
+    jitterDither: 0
+    temporalResponse: 0.005
+    temporalDepthThreshold: 0.1
+  ssgiShader: {fileID: 4800000, guid: 9490a711bfc34f8cbeef660f439b2d0e, type: 3}
 --- !u!114 &8235197496059556877
 MonoBehaviour:
   m_ObjectHideFlags: 0

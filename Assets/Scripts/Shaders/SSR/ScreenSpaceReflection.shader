@@ -31,7 +31,7 @@ Shader "Hidden/SSR/ScreenSpaceReflection"
             #include "Packages/com.unity.render-pipelines.universal/ShaderLibrary/DeclareDepthTexture.hlsl"
             #include "Packages/com.unity.render-pipelines.universal/ShaderLibrary/DeclareOpaqueTexture.hlsl"
             #include "../GI/Commond.hlsl"
-            #include "../GI/SSRUtility.hlsl"
+            #include "../GI/ScreenSpaceRayMarch.hlsl"
 
             float _SSRMaxDistance;
             int   _SSRMaxSteps;
@@ -43,9 +43,9 @@ Shader "Hidden/SSR/ScreenSpaceReflection"
 
                 float rawDepth = SampleSceneDepth(uv);
                 #if UNITY_REVERSED_Z
-                    if (rawDepth == 1.0) return float4(0, 0, 0, 0); // sky
+                    if (rawDepth <= 0.000001) return float4(0, 0, 0, 0); // sky
                 #else
-                    if (rawDepth == 0.0) return float4(0, 0, 0, 0);
+                    if (rawDepth >= 0.999999) return float4(0, 0, 0, 0);
                 #endif
 
                 float3 viewPos = ComputeViewSpacePosition(uv, rawDepth);
@@ -58,13 +58,13 @@ Shader "Hidden/SSR/ScreenSpaceReflection"
                 float3 rayStartVS = viewPos;
                 float3 rayEndVS   = viewPos + rayDir * _SSRMaxDistance;
 
-                SSRHit hit = SSRMarchBinary(rayStartVS, rayEndVS, _SSRMaxSteps, _SSRThickness, SSR_BINARY_STEPS);
-                // SSRHit hit = SSRMarchDDA(rayStartVS, rayEndVS, _SSRMaxSteps, _SSRThickness);
-                // SSRHit hit = SSRMarchHiZ(rayStartVS, rayEndVS, _SSRMaxSteps, _SSRThickness);
+                ScreenSpaceRayHit hit = MarchScreenSpaceRayBinary(rayStartVS, rayEndVS, _SSRMaxSteps, _SSRThickness, SCREEN_SPACE_RAY_BINARY_STEPS);
+                // ScreenSpaceRayHit hit = MarchScreenSpaceRayDDA(rayStartVS, rayEndVS, _SSRMaxSteps, _SSRThickness);
+                // ScreenSpaceRayHit hit = MarchScreenSpaceRayHiZ(rayStartVS, rayEndVS, _SSRMaxSteps, _SSRThickness);
 
                 // RGB=反射色, A=混合系数（hit=0.5, miss=0）
                 if (hit.hit)
-                    return float4(hit.color, 0.5);
+                    return float4(SampleSceneColor(hit.hitUV), 0.5);
                 return float4(0, 0, 0, 0);
             }
             ENDHLSL

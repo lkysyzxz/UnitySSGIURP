@@ -28,6 +28,7 @@ Shader "GIDev/URP/MainLightDirect"
             #pragma vertex Vert
             #pragma fragment Frag
             #pragma multi_compile _ _MAIN_LIGHT_SHADOWS _MAIN_LIGHT_SHADOWS_CASCADE _MAIN_LIGHT_SHADOWS_SCREEN
+            #pragma multi_compile _ _ADDITIONAL_LIGHTS
             #pragma multi_compile_fragment _ _SHADOWS_SOFT _SHADOWS_SOFT_LOW _SHADOWS_SOFT_MEDIUM _SHADOWS_SOFT_HIGH
 
             #include "Packages/com.unity.render-pipelines.universal/ShaderLibrary/Core.hlsl"
@@ -78,6 +79,16 @@ Shader "GIDev/URP/MainLightDirect"
 
                 half4 baseColor = SAMPLE_TEXTURE2D(_MainTex, sampler_MainTex, input.uv) * _BaseColor;
                 half3 color = baseColor.rgb * mainLight.color * ndotl * mainLight.shadowAttenuation;
+
+                #if defined(_ADDITIONAL_LIGHTS)
+                uint additionalLightCount = GetAdditionalLightsCount();
+                LIGHT_LOOP_BEGIN(additionalLightCount)
+                    Light additionalLight = GetAdditionalLight(lightIndex, input.positionWS);
+                    half additionalNdotL = saturate(dot(normalWS, additionalLight.direction));
+                    color += baseColor.rgb * additionalLight.color * additionalNdotL
+                        * additionalLight.distanceAttenuation * additionalLight.shadowAttenuation;
+                LIGHT_LOOP_END
+                #endif
 
                 return half4(color, baseColor.a);
             }
