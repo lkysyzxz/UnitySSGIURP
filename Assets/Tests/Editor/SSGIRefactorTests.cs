@@ -92,6 +92,38 @@ public class SSGIRefactorTests
         return sample.sqrMagnitude > 1e-12f ? sample.normalized : Vector3.forward;
     }
 
+    private static float EdgeAwareWeight(float centerDepth, Vector3 centerNormal,
+                                         float sampleDepth, Vector3 sampleNormal, bool valid)
+    {
+        if (!valid || sampleDepth < 0.0f)
+            return 0.0f;
+
+        float depthWeight = Mathf.Exp(-5.0f * Mathf.Abs(centerDepth - sampleDepth));
+        float normalWeight = Mathf.Max(0.0f, Vector3.Dot(centerNormal, sampleNormal));
+        return depthWeight * normalWeight;
+    }
+
+    private static Vector4 FilterEdgeAwareSamples(Vector3[] colors, float[] depths,
+                                                  Vector3[] normals, bool[] valid,
+                                                  float centerDepth, Vector3 centerNormal)
+    {
+        Assert.That(colors.Length, Is.EqualTo(depths.Length));
+        Assert.That(colors.Length, Is.EqualTo(normals.Length));
+        Assert.That(colors.Length, Is.EqualTo(valid.Length));
+
+        Vector3 filtered = Vector3.zero;
+        float weightSum = 0.0f;
+        for (int i = 0; i < colors.Length; i++)
+        {
+            float weight = EdgeAwareWeight(centerDepth, centerNormal, depths[i], normals[i], valid[i]);
+            filtered += colors[i] * weight;
+            weightSum += weight;
+        }
+
+        filtered /= Mathf.Max(0.001f, weightSum);
+        return new Vector4(filtered.x, filtered.y, filtered.z, centerDepth);
+    }
+
     [Test]
     public void DirectionSequence_IsPrefixIndependentAndAppendable()
     {
@@ -624,6 +656,78 @@ public class SSGIRefactorTests
         Assert.That(utility, Does.Match(@"traveled\s*\+=\s*stride\s*;"));
         Assert.That(utility, Does.Match(@"float\s+t\s*=\s*traveled\s*/\s*totalDist\s*;"));
         Assert.That(utility, Does.Not.Match(@"float\s+t\s*=\s*saturate"));
+    }
+
+    [Test]
+    public void EdgeAwareFilter_WeightsDepthAndNormalsAndPreservesCenterDepth()
+    {
+        Vector3 forward = Vector3.forward;
+        Vector3[] uniformColors =
+        {
+            Vector3.one,
+            Vector3.one * 2.0f,
+            Vector3.one * 3.0f,
+            Vector3.one * 4.0f,
+            Vector3.one * 5.0f
+        };
+        float[] uniformDepths = { 2.0f, 2.0f, 2.0f, 2.0f, 2.0f };
+        Vector3[] uniformNormals = { forward, forward, forward, forward, forward };
+        bool[] allValid = { true, true, true, true, true };
+
+        Vector4 uniform = FilterEdgeAwareSamples(
+            uniformColors, uniformDepths, uniformNormals, allValid, 2.0f, forward);
+        Assert.That(uniform.x, Is.EqualTo(3.0f).Within(1e-6f));
+        Assert.That(uniform.y, Is.EqualTo(3.0f).Within(1e-6f));
+        Assert.That(uniform.z, Is.EqualTo(3.0f).Within(1e-6f));
+        Assert.That(uniform.w, Is.EqualTo(2.0f), "The center linear depth must survive both filter passes unchanged.");
+
+        float depthEdgeWeight = Mathf.Exp(-5.0f);
+        Vector4 depthEdge = FilterEdgeAwareSamples(
+            new[] { Vector3.one, Vector3.one * 10.0f },
+            new[] { 2.0f, 3.0f },
+            new[] { forward, forward },
+            new[] { true, true },
+            2.0f,
+            forward);
+        float expectedDepthEdge = (1.0f + 10.0f * depthEdgeWeight) / (1.0f + depthEdgeWeight);
+        Assert.That(depthEdge.x, Is.EqualTo(expectedDepthEdge).Within(1e-6f));
+
+        Assert.That(EdgeAwareWeight(2.0f, forward, 2.0f, Vector3.right, true), Is.Zero);
+        Assert.That(EdgeAwareWeight(2.0f, forward, 2.0f, Vector3.back, true), Is.Zero);
+        Assert.That(EdgeAwareWeight(2.0f, forward, -1.0f, forward, true), Is.Zero);
+        Assert.That(EdgeAwareWeight(2.0f, forward, 2.0f, forward, false), Is.Zero);
+    }
+
+    [Test]
+    public void SSGIBlur_UsesIterativeFiveTapDepthNormalCrossFilter()
+    {
+        string blur = ReadAsset("Scripts", "Shaders", "GI", "Blur.hlsl");
+        string shader = ReadAsset("Scripts", "Shaders", "SSGI", "ScreenSpaceGlobalIllumination.shader");
+        string feature = ReadAsset("Scripts", "Runtime", "Features", "ScreenSpaceGlobalIlluminationFeature.cs");
+
+        Assert.That(blur, Does.Contain("SampleSSGIEdgeAwareFilter"));
+        Assert.That(blur, Does.Match(@"SSGI_FILTER_OFFSETS\s*\[\s*5\s*\]"));
+        Assert.That(blur, Does.Match(@"float2\s*\(\s*0(?:\.0)?\s*,\s*0(?:\.0)?\s*\)"));
+        Assert.That(blur, Does.Match(@"float2\s*\(\s*1(?:\.0)?\s*,\s*0(?:\.0)?\s*\)"));
+        Assert.That(blur, Does.Match(@"float2\s*\(\s*-1(?:\.0)?\s*,\s*0(?:\.0)?\s*\)"));
+        Assert.That(blur, Does.Match(@"float2\s*\(\s*0(?:\.0)?\s*,\s*1(?:\.0)?\s*\)"));
+        Assert.That(blur, Does.Match(@"float2\s*\(\s*0(?:\.0)?\s*,\s*-1(?:\.0)?\s*\)"));
+        Assert.That(blur, Does.Match(@"exp\s*\(\s*-SSGI_FILTER_DEPTH_FALLOFF\s*\*\s*abs\s*\(\s*centerDepth\s*-\s*sampleDepth\s*\)\s*\)"));
+        Assert.That(blur, Does.Match(@"saturate\s*\(\s*dot\s*\(\s*centerNormal\s*,\s*sampleNormal\s*\)\s*\)"));
+        Assert.That(blur, Does.Match(@"max\s*\(\s*0\.001\s*,\s*weightSum\s*\)"));
+        Assert.That(blur, Does.Match(@"return\s+float4\s*\(\s*filtered\s*,\s*center\.a\s*\)"));
+        Assert.That(blur, Does.Match(@"sampleUV\.x\s*<\s*0\.0[\s\S]*sampleUV\.x\s*>\s*1\.0"));
+        Assert.That(blur, Does.Match(@"sample\.a\s*<\s*0\.0"));
+        Assert.That(blur, Does.Not.Contain("Gaussian"));
+        Assert.That(blur, Does.Not.Contain("GI_BLUR_WEIGHT"));
+
+        Assert.That(Regex.Matches(shader, "DeclareDepthTexture.hlsl").Count, Is.EqualTo(3));
+        Assert.That(Regex.Matches(shader, "../GI/Commond.hlsl").Count, Is.EqualTo(3));
+        Assert.That(shader, Does.Match(@"FragBlurH[\s\S]*SampleSSGIEdgeAwareFilter\s*\(\s*input\.texcoord\s*,\s*_BlurSpread\s*\)"));
+        Assert.That(shader, Does.Match(@"FragBlurV[\s\S]*SampleSSGIEdgeAwareFilter\s*\(\s*input\.texcoord\s*,\s*_BlurSpread\s*\*\s*2\.0\s*\)"));
+        Assert.That(feature, Does.Match(@"(?i)base edge-aware filter radius"));
+        Assert.That(feature, Does.Match(@"material\s*,\s*1\s*\)[\s\S]*material\s*,\s*2\s*\)"));
+        Assert.That(feature, Does.Match(@"ConfigureInput\s*\(\s*ScriptableRenderPassInput\.Depth\s*\|\s*ScriptableRenderPassInput\.Color\s*\)"));
     }
 
     [Test]

@@ -47,7 +47,7 @@ public class ScreenSpaceGlobalIlluminationFeature : ScriptableRendererFeature
         public float maxBlend = 0.35f;
 
         [Header("Blur")]
-        [Tooltip("Gaussian blur spread in pixels (0 = no blur)")]
+        [Tooltip("Base edge-aware filter radius in pixels; the second iteration uses twice this radius (0 = no blur)")]
         [Range(0f, 8f)]
         public float blurSpread = 1.5f;
 

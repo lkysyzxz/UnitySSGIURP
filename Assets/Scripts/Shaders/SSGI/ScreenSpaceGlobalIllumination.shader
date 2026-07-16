@@ -120,11 +120,13 @@ Shader "Hidden/SSGI/ScreenSpaceGlobalIllumination"
             #include "Packages/com.unity.render-pipelines.core/ShaderLibrary/Common.hlsl"
             #include "Packages/com.unity.render-pipelines.universal/ShaderLibrary/Core.hlsl"
             #include "Packages/com.unity.render-pipelines.core/Runtime/Utilities/Blit.hlsl"
+            #include "Packages/com.unity.render-pipelines.universal/ShaderLibrary/DeclareDepthTexture.hlsl"
+            #include "../GI/Commond.hlsl"
             #include "../GI/Blur.hlsl"
 
             float4 FragBlurH(Varyings input) : SV_Target
             {
-                return SampleGaussianBlurHorizontal(input.texcoord, _BlurSpread);
+                return SampleSSGIEdgeAwareFilter(input.texcoord, _BlurSpread);
             }
             ENDHLSL
         }
@@ -143,11 +145,13 @@ Shader "Hidden/SSGI/ScreenSpaceGlobalIllumination"
             #include "Packages/com.unity.render-pipelines.core/ShaderLibrary/Common.hlsl"
             #include "Packages/com.unity.render-pipelines.universal/ShaderLibrary/Core.hlsl"
             #include "Packages/com.unity.render-pipelines.core/Runtime/Utilities/Blit.hlsl"
+            #include "Packages/com.unity.render-pipelines.universal/ShaderLibrary/DeclareDepthTexture.hlsl"
+            #include "../GI/Commond.hlsl"
             #include "../GI/Blur.hlsl"
 
             float4 FragBlurV(Varyings input) : SV_Target
             {
-                return SampleGaussianBlurVertical(input.texcoord, _BlurSpread);
+                return SampleSSGIEdgeAwareFilter(input.texcoord, _BlurSpread * 2.0);
             }
             ENDHLSL
         }
