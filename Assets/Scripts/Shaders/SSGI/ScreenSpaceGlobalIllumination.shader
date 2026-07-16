@@ -39,7 +39,6 @@ Shader "Hidden/SSGI/ScreenSpaceGlobalIllumination"
             float _SSGIThickness;
             float _SSGIOriginBias;
             float _SSGIIntensity;
-            float _SSGIMaxBlend;
 
             TEXTURE2D_X(_SSGIRadianceTexture);
 
@@ -201,32 +200,5 @@ Shader "Hidden/SSGI/ScreenSpaceGlobalIllumination"
             ENDHLSL
         }
 
-        Pass
-        {
-            Name "Composite"
-            Cull Off
-            ZWrite Off
-            ZTest Always
-
-            HLSLPROGRAM
-            #pragma vertex Vert
-            #pragma fragment FragComposite
-
-            #include "Packages/com.unity.render-pipelines.core/ShaderLibrary/Common.hlsl"
-            #include "Packages/com.unity.render-pipelines.universal/ShaderLibrary/Core.hlsl"
-            #include "Packages/com.unity.render-pipelines.core/Runtime/Utilities/Blit.hlsl"
-
-            TEXTURE2D_X(_OriginalTexture);
-            float _SSGIMaxBlend;
-
-            float4 FragComposite(Varyings input) : SV_Target
-            {
-                float2 uv = input.texcoord;
-                float4 indirect = SAMPLE_TEXTURE2D_X(_BlitTexture, sampler_LinearClamp, uv);
-                float3 original = SAMPLE_TEXTURE2D_X(_OriginalTexture, sampler_LinearClamp, uv).rgb;
-                return float4(original + indirect.rgb * saturate(_SSGIMaxBlend), 1.0);
-            }
-            ENDHLSL
-        }
     }
 }

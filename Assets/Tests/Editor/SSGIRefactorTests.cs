@@ -226,7 +226,7 @@ public class SSGIRefactorTests
         Assert.That(shader, Does.Match(@"outgoingRadiance\s*=\s*irradiance\s*/\s*rayCount\s*;"));
         Assert.That(shader, Does.Not.Contain("SSGI_UNIFORM_HEMISPHERE_PDF"));
         Assert.That(shader, Does.Not.Match(@"float\s+ndotl\s*="));
-        Assert.That(shader, Does.Match(@"saturate\s*\(\s*_SSGIMaxBlend\s*\)"));
+        Assert.That(shader, Does.Not.Contain("Name \"Composite\""));
         Assert.That(shader, Does.Not.Contain("hitCount"));
         Assert.That(shader, Does.Not.Contain("weightSum"));
         Assert.That(shader, Does.Not.Contain("distanceWeight"));
@@ -330,7 +330,7 @@ public class SSGIRefactorTests
         Assert.That(shader, Does.Match(@"return\s+float4\s*\(\s*accumulated\s*,\s*current\.a\s*\)"));
         Assert.That(shader, Does.Match(@"outgoingRadiance\s*\*\s*_SSGIIntensity\s*,\s*min\s*\(\s*viewPos\.z\s*,\s*65500\.0\s*\)"));
         Assert.That(Regex.Matches(shader, @"return\s+float4\s*\(\s*0\s*,\s*0\s*,\s*0\s*,\s*-1\.0\s*\)").Count, Is.EqualTo(2));
-        Assert.That(shader, Does.Match(@"indirect\.rgb\s*\*\s*saturate\s*\(\s*_SSGIMaxBlend\s*\)"));
+        Assert.That(shader, Does.Not.Contain("_SSGIMaxBlend"));
 
         string feature = ReadAsset("Scripts", "Runtime", "Features", "ScreenSpaceGlobalIlluminationFeature.cs");
         Assert.That(feature, Does.Match(@"HistoryWeightID\s*,\s*temporalResponse\s*\)"));
@@ -339,7 +339,7 @@ public class SSGIRefactorTests
     }
 
     [Test]
-    public void TemporalRenderSequence_UsesDistinctTargetsAndExpectedPassIndices()
+    public void TemporalRenderSequence_PublishesBlurredIrradianceWithoutCompositingCameraColor()
     {
         string feature = ReadAsset("Scripts", "Runtime", "Features", "ScreenSpaceGlobalIlluminationFeature.cs");
 
@@ -347,12 +347,26 @@ public class SSGIRefactorTests
         Assert.That(feature, Does.Match(@"sourceHandle\s*,\s*state\.blurA\s*,\s*material\s*,\s*0\s*\)"));
         Assert.That(feature, Does.Match(@"state\.blurA\s*,\s*state\.HistoryWrite\s*,\s*material\s*,\s*3\s*\)"));
         Assert.That(feature, Does.Match(@"state\.HistoryWrite\s*,\s*state\.blurB\s*,\s*material\s*,\s*1\s*\)"));
-        Assert.That(feature, Does.Match(@"state\.blurB\s*,\s*state\.blurA\s*,\s*material\s*,\s*2\s*\)"));
-        Assert.That(feature, Does.Match(@"state\.blurA\s*,\s*state\.compositeRT\s*,\s*material\s*,\s*4\s*\)"));
+        Assert.That(feature, Does.Match(@"state\.blurB\s*,\s*state\.irradianceRT\s*,\s*material\s*,\s*2\s*\)"));
         Assert.That(feature, Does.Match(@"material\s*,\s*3\s*\)[\s\S]*material\s*,\s*1\s*\)[\s\S]*material\s*,\s*2\s*\)"));
-        Assert.That(feature, Does.Match(@"else\s*\{\s*Blitter\.BlitCameraTexture\s*\(\s*cmd\s*,\s*state\.HistoryRead\s*,\s*state\.blurB\s*,\s*material\s*,\s*1\s*\)[\s\S]*state\.blurB\s*,\s*state\.blurA\s*,\s*material\s*,\s*2\s*\)[\s\S]*state\.blurA\s*,\s*state\.compositeRT\s*,\s*material\s*,\s*4\s*\)"));
-        Assert.That(feature, Does.Match(@"SetGlobalTexture\s*\(\s*OriginalTextureID\s*,\s*sourceHandle\s*\)"));
+        Assert.That(feature, Does.Match(@"SetGlobalTexture\s*\(\s*RadianceTextureID\s*,\s*state\.radianceRT\s*\)"));
+        Assert.That(feature, Does.Match(@"SetGlobalTexture\s*\(\s*IrradianceTextureID\s*,\s*state\.irradianceRT\s*\)"));
+        Assert.That(feature, Does.Not.Contain("compositeRT"));
+        Assert.That(feature, Does.Not.Match(@"BlitCameraTexture\s*\(\s*cmd\s*,\s*state\.irradianceRT\s*,\s*sourceHandle"));
         Assert.That(feature, Does.Not.Match(@"BlitCameraTexture\s*\([^;]*state\.HistoryRead\s*,\s*state\.HistoryRead"));
+    }
+
+    [Test]
+    public void PreviousIrradiance_IsBoundPerCameraBeforeOpaqueRendering()
+    {
+        string feature = ReadAsset("Scripts", "Runtime", "Features", "ScreenSpaceGlobalIlluminationFeature.cs");
+
+        Assert.That(feature, Does.Contain("IrradianceHistorySetupPass"));
+        Assert.That(feature, Does.Match(@"irradianceHistorySetupPass\.renderPassEvent\s*=\s*RenderPassEvent\.BeforeRenderingOpaques"));
+        Assert.That(feature, Does.Match(@"EnqueuePass\s*\(\s*irradianceHistorySetupPass\s*\)"));
+        Assert.That(feature, Does.Match(@"state\.historyValid\s*&&\s*poseMatches\s*&&\s*configurationMatches"));
+        Assert.That(feature, Does.Match(@"SetGlobalFloat\s*\(\s*IrradianceValidID\s*,\s*irradianceValid\s*\?\s*1\.0f\s*:\s*0\.0f\s*\)"));
+        Assert.That(feature, Does.Match(@"SetGlobalTexture\s*\(\s*IrradianceTextureID\s*,\s*state\.irradianceRT\s*\)"));
     }
 
     [Test]
@@ -360,8 +374,9 @@ public class SSGIRefactorTests
     {
         string feature = ReadAsset("Scripts", "Runtime", "Features", "ScreenSpaceGlobalIlluminationFeature.cs");
 
-        foreach (string handle in new[] { "radianceRT", "blurA", "blurB", "historyA", "historyB", "compositeRT" })
+        foreach (string handle in new[] { "radianceRT", "blurA", "blurB", "historyA", "historyB", "irradianceRT" })
             Assert.That(feature, Does.Match(handle + @"\?\.Release\s*\(\s*\)"), $"Expected {handle} to be released");
+        Assert.That(feature, Does.Match(@"Shader\.SetGlobalFloat\s*\(\s*IrradianceValidID\s*,\s*0\.0f\s*\)"));
         Assert.That(feature, Does.Match(@"foreach\s*\(\s*CameraState\s+state\s+in\s+cameraStates\.Values\s*\)"));
         Assert.That(feature, Does.Match(@"cameraStates\.Clear\s*\(\s*\)"));
     }
@@ -457,7 +472,6 @@ public class SSGIRefactorTests
         Assert.That(feature, Does.Contain("IsFinite(settings.thickness)"));
         Assert.That(feature, Does.Contain("IsFinite(settings.originBias)"));
         Assert.That(feature, Does.Contain("IsFinite(settings.intensity)"));
-        Assert.That(feature, Does.Contain("IsFinite(settings.maxBlend)"));
         Assert.That(feature, Does.Contain("IsFinite(settings.temporalResponse)"));
         Assert.That(feature, Does.Contain("IsFinite(settings.temporalDepthThreshold)"));
     }
@@ -745,5 +759,17 @@ public class SSGIRefactorTests
         Assert.That(shader, Does.Match(@"color\s*\+=\s*baseColor\.rgb\s*\*\s*additionalLight\.color\s*\*\s*additionalNdotL"));
         Assert.That(shader, Does.Match(@"additionalLight\.distanceAttenuation\s*\*\s*additionalLight\.shadowAttenuation"));
         Assert.That(shader, Does.Match(@"baseColor\.rgb\s*\*\s*mainLight\.color\s*\*\s*ndotl\s*\*\s*mainLight\.shadowAttenuation"));
+    }
+
+    [Test]
+    public void MainLightDirect_AddsPreviousIrradianceTimesAlbedoAtProjectedPixel()
+    {
+        string shader = ReadAsset("Scripts", "Shaders", "Objects", "MainLightDirect.shader");
+
+        Assert.That(shader, Does.Contain("TEXTURE2D_X(_SSGIIrradianceTexture)"));
+        Assert.That(shader, Does.Contain("_SSGIIrradianceValid"));
+        Assert.That(shader, Does.Match(@"screenUV\s*=\s*GetNormalizedScreenSpaceUV\s*\(\s*input\.positionCS\s*\)"));
+        Assert.That(shader, Does.Match(@"SAMPLE_TEXTURE2D_X\s*\(\s*_SSGIIrradianceTexture\s*,\s*sampler_LinearClamp\s*,\s*screenUV\s*\)\.rgb"));
+        Assert.That(shader, Does.Match(@"color\s*\+=\s*irradiance\s*\*\s*baseColor\.rgb"));
     }
 }

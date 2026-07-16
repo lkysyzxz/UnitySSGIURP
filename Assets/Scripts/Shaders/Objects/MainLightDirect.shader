@@ -41,12 +41,15 @@ Shader "GIDev/URP/MainLightDirect"
 
             TEXTURE2D(_MainTex);
             SAMPLER(sampler_MainTex);
+            TEXTURE2D_X(_SSGIIrradianceTexture);
+            float _SSGIIrradianceValid;
 
             struct Attributes
             {
                 float4 positionOS : POSITION;
                 float3 normalOS : NORMAL;
                 float2 uv : TEXCOORD0;
+                UNITY_VERTEX_INPUT_INSTANCE_ID
             };
 
             struct Varyings
@@ -55,11 +58,14 @@ Shader "GIDev/URP/MainLightDirect"
                 float3 normalWS : TEXCOORD0;
                 float3 positionWS : TEXCOORD1;
                 float2 uv : TEXCOORD2;
+                UNITY_VERTEX_OUTPUT_STEREO
             };
 
             Varyings Vert(Attributes input)
             {
                 Varyings output;
+                UNITY_SETUP_INSTANCE_ID(input);
+                UNITY_INITIALIZE_VERTEX_OUTPUT_STEREO(output);
                 VertexPositionInputs positionInputs = GetVertexPositionInputs(input.positionOS.xyz);
 
                 output.positionCS = positionInputs.positionCS;
@@ -72,6 +78,7 @@ Shader "GIDev/URP/MainLightDirect"
 
             half4 Frag(Varyings input) : SV_Target
             {
+                UNITY_SETUP_STEREO_EYE_INDEX_POST_VERTEX(input);
                 half3 normalWS = NormalizeNormalPerPixel(input.normalWS);
                 float4 shadowCoord = TransformWorldToShadowCoord(input.positionWS);
                 Light mainLight = GetMainLight(shadowCoord);
@@ -89,6 +96,14 @@ Shader "GIDev/URP/MainLightDirect"
                         * additionalLight.distanceAttenuation * additionalLight.shadowAttenuation;
                 LIGHT_LOOP_END
                 #endif
+
+                if (_SSGIIrradianceValid > 0.0)
+                {
+                    float2 screenUV = GetNormalizedScreenSpaceUV(input.positionCS);
+                    half3 irradiance = SAMPLE_TEXTURE2D_X(
+                        _SSGIIrradianceTexture, sampler_LinearClamp, screenUV).rgb;
+                    color += irradiance * baseColor.rgb;
+                }
 
                 return half4(color, baseColor.a);
             }
