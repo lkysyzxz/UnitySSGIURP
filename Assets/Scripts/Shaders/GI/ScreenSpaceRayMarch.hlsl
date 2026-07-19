@@ -210,8 +210,6 @@ ScreenSpaceRayHit MarchScreenSpaceRayBinary(float3 rayStartVS, float3 rayEndVS,
                                             int maxSteps, float thickness, int binarySteps)
 {
     ScreenSpaceRayHit result = (ScreenSpaceRayHit)0;
-    if (!ClipScreenSpaceRaySegment(rayStartVS, rayEndVS))
-        return result;
 
     float2 startUV = ProjectVStoUV(rayStartVS);
     float2 endUV   = ProjectVStoUV(rayEndVS);

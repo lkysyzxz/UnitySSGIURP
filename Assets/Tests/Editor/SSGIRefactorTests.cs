@@ -268,7 +268,7 @@ public class SSGIRefactorTests
     }
 
     [Test]
-    public void TemporalState_IsPerCameraAndResetsForPoseDescriptorProjectionOrSettingsChanges()
+    public void TemporalState_IsPerCameraAndReprojectsViewChangesWithoutResettingHistory()
     {
         string feature = ReadAsset("Scripts", "Runtime", "Features", "ScreenSpaceGlobalIlluminationFeature.cs");
 
@@ -278,56 +278,64 @@ public class SSGIRefactorTests
         Assert.That(feature, Does.Contain("previousPosition"));
         Assert.That(feature, Does.Contain("previousRotation"));
         Assert.That(feature, Does.Contain("previousProjectionMatrix"));
+        Assert.That(feature, Does.Contain("previousViewProjectionMatrix"));
+        Assert.That(feature, Does.Contain("previousWorldToCameraMatrix"));
         Assert.That(feature, Does.Contain("previousSettingsHash"));
         Assert.That(feature, Does.Contain("historyCount"));
         Assert.That(feature, Does.Contain("sampleOffset"));
         Assert.That(feature, Does.Contain("lastUpdateFrame"));
+        Assert.That(feature, Does.Match(@"viewChanged\s*=\s*!state\.hasPreviousPose"));
         Assert.That(feature, Does.Match(@"previousPosition\s*!=\s*cam\.transform\.position"));
         Assert.That(feature, Does.Match(@"previousRotation\s*!=\s*cam\.transform\.rotation"));
         Assert.That(feature, Does.Match(@"cam\.nonJitteredProjectionMatrix"));
         Assert.That(feature, Does.Match(@"previousProjectionMatrix\s*!=\s*projectionMatrix"));
         Assert.That(feature, Does.Match(@"previousSettingsHash\s*!=\s*settingsHash"));
-        Assert.That(feature, Does.Match(@"resetHistory\s*=\s*poseChanged\s*\|\|\s*configurationChanged"));
+        Assert.That(feature, Does.Match(@"resetHistory\s*=\s*configurationChanged"));
+        Assert.That(feature, Does.Not.Match(@"resetHistory\s*=.*viewChanged"));
         Assert.That(feature, Does.Match(@"descriptorChanged[\s\S]*ResetTemporalState\s*\(\s*state\s*\)"));
         Assert.That(feature, Does.Match(@"lastUpdateFrame\s*!=\s*Time\.frameCount"));
     }
 
     [Test]
-    public void PoseChange_ResetsAndAccumulatesEvenWithinSameFrame()
+    public void ViewChange_AccumulatesAndAdvancesSamplesWithoutDiscardingHistory()
     {
         string feature = ReadAsset("Scripts", "Runtime", "Features", "ScreenSpaceGlobalIlluminationFeature.cs");
 
         Assert.That(feature, Does.Match(@"if\s*\(\s*resetHistory\s*\)\s*ResetTemporalState\s*\(\s*state\s*\)"));
-        Assert.That(feature, Does.Match(@"bool\s+accumulate\s*=\s*resetHistory\s*\|\|\s*isNewLogicalFrame"));
-        Assert.That(feature, Does.Not.Match(@"if\s*\(\s*isNewLogicalFrame\s*&&\s*poseChanged\s*\)"));
+        Assert.That(feature, Does.Match(@"else\s+if\s*\(\s*viewChanged\s*&&\s*state\.historyValid\s*\)[\s\S]*state\.historyCount\s*=\s*Mathf\.Min\s*\([\s\S]*MotionHistoryFrameCap"));
+        Assert.That(feature, Does.Match(@"MotionHistoryFrameCap\s*=\s*4"));
+        Assert.That(feature, Does.Match(@"bool\s+accumulate\s*=\s*resetHistory\s*\|\|\s*isNewLogicalFrame\s*\|\|\s*viewChanged"));
         Assert.That(feature, Does.Match(@"if\s*\(\s*!resetHistory\s*&&\s*state\.historyValid\s*\)[\s\S]*sampleOffset\s*=\s*\(\s*state\.sampleOffset\s*\+\s*rayCount"));
     }
 
     [Test]
-    public void TemporalAccumulation_UsesFixedEmaAndRejectsDepthDiscontinuities()
+    public void TemporalAccumulation_UsesReprojectionValidationAndEnergyPreservingAverage()
     {
-        Vector4 history = new Vector4(2.0f, 4.0f, 6.0f, 0.2f);
-        Vector4 current = new Vector4(8.0f, 1.0f, 3.0f, 0.8f);
-        const float weight = 0.05f;
-        Vector3 accumulatedRgb = history + (current - history) * weight;
-        Vector4 accumulated = new Vector4(accumulatedRgb.x, accumulatedRgb.y, accumulatedRgb.z, current.w);
-
-        Vector4 expected = new Vector4(2.3f, 3.85f, 5.85f, 0.8f);
-        for (int component = 0; component < 4; component++)
-            Assert.That(accumulated[component], Is.EqualTo(expected[component]).Within(1e-6f));
+        const float previousSampleCount = 4.0f;
+        const float maxHistoryFrames = 32.0f;
+        const float temporalResponse = 0.05f;
+        Func<float, float> currentFrameWeight = count => count < maxHistoryFrames
+            ? 1.0f / (count + 1.0f)
+            : temporalResponse;
+        float runningWeight = currentFrameWeight(previousSampleCount);
+        float cappedWeight = currentFrameWeight(maxHistoryFrames);
+        Assert.That(runningWeight, Is.EqualTo(0.2f).Within(1e-6f));
+        Assert.That(cappedWeight, Is.EqualTo(0.05f).Within(1e-6f));
 
         string shader = ReadAsset("Scripts", "Shaders", "SSGI", "ScreenSpaceGlobalIllumination.shader");
+        string temporal = ReadAsset("Scripts", "Shaders", "GI", "Temporal.hlsl");
         Assert.That(shader, Does.Contain("Name \"Accumulate\""));
-        Assert.That(shader, Does.Contain("TEXTURE2D_X(_SSGIHistoryTexture)"));
-        Assert.That(shader, Does.Match(@"if\s*\(\s*_SSGIHistoryValid\s*<=\s*0\.0\s*\)\s*return\s+current"));
-        Assert.That(shader, Does.Match(@"currentHasGeometry\s*=\s*current\.a\s*>=\s*0\.0"));
-        Assert.That(shader, Does.Match(@"historyHasGeometry\s*=\s*history\.a\s*>=\s*0\.0"));
-        Assert.That(shader, Does.Match(@"currentHasGeometry\s*!=\s*historyHasGeometry\s*\|\|\s*!currentHasGeometry[\s\S]*return\s+current"));
-        Assert.That(shader, Does.Match(@"currentDepth\s*=\s*current\.a"));
-        Assert.That(shader, Does.Match(@"historyDepth\s*=\s*history\.a"));
-        Assert.That(shader, Does.Match(@"abs\s*\(\s*currentDepth\s*-\s*historyDepth\s*\)\s*>\s*depthThreshold[\s\S]*return\s+current"));
-        Assert.That(shader, Does.Match(@"accumulated\s*=\s*history\.rgb\s*\+\s*\(\s*current\.rgb\s*-\s*history\.rgb\s*\)\s*\*\s*_SSGIHistoryWeight"));
+        Assert.That(temporal, Does.Contain("TEXTURE2D_X(_MotionVectorTexture)"));
+        Assert.That(temporal, Does.Match(@"previousUV\s*=\s*uv\s*-\s*motion"));
+        Assert.That(temporal, Does.Match(@"historyDepth\s*=\s*SAMPLE_TEXTURE2D_X\s*\([\s\S]*sampler_PointClamp\s*,\s*previousUV\s*\)\.a"));
+        Assert.That(temporal, Does.Match(@"abs\s*\(\s*historyDepth\s*-\s*previousExpectedDepth\s*\)\s*>\s*depthThreshold"));
+        Assert.That(temporal, Does.Match(@"runningAverageWeight\s*=\s*rcp\s*\(\s*_SSGIHistoryFrameCount\s*\+\s*1\.0\s*\)"));
+        Assert.That(shader, Does.Not.Contain("ClampSSGIHistoryToCurrentNeighborhood"));
+        Assert.That(shader, Does.Not.Contain("RGBToYCoCg"));
+        Assert.That(shader, Does.Match(@"accumulated\s*=\s*lerp\s*\(\s*temporal\.irradianceDepth\.rgb\s*,\s*current\.rgb\s*,\s*currentFrameWeight\s*\)"));
         Assert.That(shader, Does.Match(@"return\s+float4\s*\(\s*accumulated\s*,\s*current\.a\s*\)"));
+        Assert.That(shader, Does.Not.Contain("Name \"UpdateMoments\""));
+        Assert.That(shader, Does.Not.Contain("Name \"UpdateNormalCount\""));
         Assert.That(shader, Does.Match(@"outgoingRadiance\s*\*\s*_SSGIIntensity\s*,\s*min\s*\(\s*viewPos\.z\s*,\s*65500\.0\s*\)"));
         Assert.That(Regex.Matches(shader, @"return\s+float4\s*\(\s*0\s*,\s*0\s*,\s*0\s*,\s*-1\.0\s*\)").Count, Is.EqualTo(2));
         Assert.That(shader, Does.Not.Contain("_SSGIMaxBlend"));
@@ -335,7 +343,9 @@ public class SSGIRefactorTests
         string feature = ReadAsset("Scripts", "Runtime", "Features", "ScreenSpaceGlobalIlluminationFeature.cs");
         Assert.That(feature, Does.Match(@"HistoryWeightID\s*,\s*temporalResponse\s*\)"));
         Assert.That(feature, Does.Match(@"HistoryDepthThresholdID\s*,\s*temporalDepthThreshold\s*\)"));
-        Assert.That(feature, Does.Not.Match(@"HistoryWeightID\s*,\s*1\.0f\s*/"));
+        Assert.That(feature, Does.Match(@"HistoryFrameCountID\s*,[\s\S]*state\.historyCount"));
+        Assert.That(feature, Does.Match(@"ScriptableRenderPassInput\.Motion"));
+        Assert.That(feature, Does.Match(@"hash\s*=\s*hash\s*\*\s*31\s*\+\s*TemporalAlgorithmVersion"));
     }
 
     [Test]
@@ -354,6 +364,8 @@ public class SSGIRefactorTests
         Assert.That(feature, Does.Not.Contain("compositeRT"));
         Assert.That(feature, Does.Not.Match(@"BlitCameraTexture\s*\(\s*cmd\s*,\s*state\.irradianceRT\s*,\s*sourceHandle"));
         Assert.That(feature, Does.Not.Match(@"BlitCameraTexture\s*\([^;]*state\.HistoryRead\s*,\s*state\.HistoryRead"));
+        Assert.That(feature, Does.Not.Contain("MomentsWrite"));
+        Assert.That(feature, Does.Not.Contain("NormalCountWrite"));
     }
 
     [Test]
@@ -364,9 +376,12 @@ public class SSGIRefactorTests
         Assert.That(feature, Does.Contain("IrradianceHistorySetupPass"));
         Assert.That(feature, Does.Match(@"irradianceHistorySetupPass\.renderPassEvent\s*=\s*RenderPassEvent\.BeforeRenderingOpaques"));
         Assert.That(feature, Does.Match(@"EnqueuePass\s*\(\s*irradianceHistorySetupPass\s*\)"));
-        Assert.That(feature, Does.Match(@"state\.historyValid\s*&&\s*poseMatches\s*&&\s*configurationMatches"));
+        Assert.That(feature, Does.Match(@"irradianceValid\s*=\s*state\.historyValid\s*&&\s*configurationMatches"));
+        Assert.That(feature, Does.Not.Contain("poseMatches"));
         Assert.That(feature, Does.Match(@"SetGlobalFloat\s*\(\s*IrradianceValidID\s*,\s*irradianceValid\s*\?\s*1\.0f\s*:\s*0\.0f\s*\)"));
         Assert.That(feature, Does.Match(@"SetGlobalTexture\s*\(\s*IrradianceTextureID\s*,\s*state\.irradianceRT\s*\)"));
+        Assert.That(feature, Does.Match(@"SetGlobalMatrix\s*\(\s*PreviousViewProjectionMatrixID\s*,\s*state\.previousViewProjectionMatrix\s*\)"));
+        Assert.That(feature, Does.Match(@"SetGlobalMatrix\s*\(\s*PreviousWorldToCameraMatrixID\s*,\s*state\.previousWorldToCameraMatrix\s*\)"));
     }
 
     [Test]
@@ -374,7 +389,10 @@ public class SSGIRefactorTests
     {
         string feature = ReadAsset("Scripts", "Runtime", "Features", "ScreenSpaceGlobalIlluminationFeature.cs");
 
-        foreach (string handle in new[] { "radianceRT", "blurA", "blurB", "historyA", "historyB", "irradianceRT" })
+        foreach (string handle in new[]
+        {
+            "radianceRT", "blurA", "blurB", "historyA", "historyB", "irradianceRT"
+        })
             Assert.That(feature, Does.Match(handle + @"\?\.Release\s*\(\s*\)"), $"Expected {handle} to be released");
         Assert.That(feature, Does.Match(@"Shader\.SetGlobalFloat\s*\(\s*IrradianceValidID\s*,\s*0\.0f\s*\)"));
         Assert.That(feature, Does.Match(@"foreach\s*\(\s*CameraState\s+state\s+in\s+cameraStates\.Values\s*\)"));
@@ -420,25 +438,30 @@ public class SSGIRefactorTests
         FieldInfo originBias = settingsType.GetField("originBias");
         FieldInfo temporalResponse = settingsType.GetField("temporalResponse");
         FieldInfo temporalDepthThreshold = settingsType.GetField("temporalDepthThreshold");
+        FieldInfo disocclusionFallback = settingsType.GetField("disocclusionFallback");
 
         Assert.That(sampleOffset, Is.Not.Null);
         Assert.That(originBias, Is.Not.Null);
         Assert.That(temporalResponse, Is.Not.Null);
         Assert.That(temporalDepthThreshold, Is.Not.Null);
+        Assert.That(disocclusionFallback, Is.Not.Null);
         object settings = Activator.CreateInstance(settingsType);
         Assert.That(sampleOffset.GetValue(settings), Is.EqualTo(0));
         Assert.That(originBias.GetValue(settings), Is.EqualTo(0.01f));
         Assert.That(temporalResponse.GetValue(settings), Is.EqualTo(0.05f));
         Assert.That(temporalDepthThreshold.GetValue(settings), Is.EqualTo(0.1f));
+        Assert.That(disocclusionFallback.GetValue(settings), Is.EqualTo(0.35f));
         Assert.That(sampleOffset.GetCustomAttribute<UnityEngine.RangeAttribute>(), Is.Not.Null);
         Assert.That(originBias.GetCustomAttribute<UnityEngine.RangeAttribute>(), Is.Not.Null);
         Assert.That(temporalResponse.GetCustomAttribute<UnityEngine.RangeAttribute>(), Is.Not.Null);
         Assert.That(temporalDepthThreshold.GetCustomAttribute<UnityEngine.MinAttribute>(), Is.Not.Null);
+        Assert.That(disocclusionFallback.GetCustomAttribute<UnityEngine.RangeAttribute>(), Is.Not.Null);
 
         string feature = ReadAsset("Scripts", "Runtime", "Features", "ScreenSpaceGlobalIlluminationFeature.cs");
         Assert.That(feature, Does.Contain("_SSGISampleOffset"));
         Assert.That(feature, Does.Contain("_SSGIOriginBias"));
         Assert.That(feature, Does.Contain("_SSGIHistoryDepthThreshold"));
+        Assert.That(feature, Does.Contain("_SSGIDisocclusionFallback"));
 
         string shader = ReadAsset("Scripts", "Shaders", "SSGI", "ScreenSpaceGlobalIllumination.shader");
         Assert.That(shader, Does.Contain("normal * _SSGIOriginBias"));
@@ -474,6 +497,13 @@ public class SSGIRefactorTests
         Assert.That(feature, Does.Contain("IsFinite(settings.intensity)"));
         Assert.That(feature, Does.Contain("IsFinite(settings.temporalResponse)"));
         Assert.That(feature, Does.Contain("IsFinite(settings.temporalDepthThreshold)"));
+        Assert.That(feature, Does.Contain("IsFinite(settings.disocclusionFallback)"));
+        Assert.That(feature, Does.Contain("Mathf.Clamp01(settings.disocclusionFallback)"));
+        Assert.That(feature, Does.Contain("Mathf.Clamp(settings.maxHistoryFrames, 2, 64)"));
+        Assert.That(feature, Does.Not.Contain("settings.temporalNormalThreshold"));
+        Assert.That(feature, Does.Not.Contain("settings.varianceThreshold"));
+        Assert.That(feature, Does.Not.Contain("settings.adaptiveRayMultiplier"));
+        Assert.That(feature, Does.Not.Contain("settings.varianceFilterStrength"));
     }
 
     [Test]
@@ -715,7 +745,8 @@ public class SSGIRefactorTests
     [Test]
     public void SSGIBlur_UsesIterativeFiveTapDepthNormalCrossFilter()
     {
-        string blur = ReadAsset("Scripts", "Shaders", "GI", "Blur.hlsl");
+        string blur = ReadAsset("Scripts", "Shaders", "GI", "SSGIBlur.hlsl");
+        string sharedBlur = ReadAsset("Scripts", "Shaders", "GI", "Blur.hlsl");
         string shader = ReadAsset("Scripts", "Shaders", "SSGI", "ScreenSpaceGlobalIllumination.shader");
         string feature = ReadAsset("Scripts", "Runtime", "Features", "ScreenSpaceGlobalIlluminationFeature.cs");
 
@@ -728,20 +759,39 @@ public class SSGIRefactorTests
         Assert.That(blur, Does.Match(@"float2\s*\(\s*0(?:\.0)?\s*,\s*-1(?:\.0)?\s*\)"));
         Assert.That(blur, Does.Match(@"exp\s*\(\s*-SSGI_FILTER_DEPTH_FALLOFF\s*\*\s*abs\s*\(\s*centerDepth\s*-\s*sampleDepth\s*\)\s*\)"));
         Assert.That(blur, Does.Match(@"saturate\s*\(\s*dot\s*\(\s*centerNormal\s*,\s*sampleNormal\s*\)\s*\)"));
+        Assert.That(blur, Does.Not.Contain("_SSGIMomentsTexture"));
+        Assert.That(blur, Does.Not.Contain("_SSGINormalCountTexture"));
+        Assert.That(blur, Does.Match(@"SSGI_FILTER_OFFSETS\s*\[\s*i\s*\]\s*\*\s*texelSize\s*\*\s*filterRadius"));
+        Assert.That(blur, Does.Match(@"weight\s*=\s*depthWeight\s*\*\s*normalWeight"));
+        Assert.That(blur, Does.Not.Contain("luminanceWeight"));
         Assert.That(blur, Does.Match(@"max\s*\(\s*0\.001\s*,\s*weightSum\s*\)"));
         Assert.That(blur, Does.Match(@"return\s+float4\s*\(\s*filtered\s*,\s*center\.a\s*\)"));
         Assert.That(blur, Does.Match(@"sampleUV\.x\s*<\s*0\.0[\s\S]*sampleUV\.x\s*>\s*1\.0"));
         Assert.That(blur, Does.Match(@"sample\.a\s*<\s*0\.0"));
         Assert.That(blur, Does.Not.Contain("Gaussian"));
         Assert.That(blur, Does.Not.Contain("GI_BLUR_WEIGHT"));
+        Assert.That(sharedBlur, Does.Contain("SampleGaussianBlurHorizontal"));
+        Assert.That(sharedBlur, Does.Contain("SampleGaussianBlurVertical"));
+        Assert.That(shader, Does.Contain("../GI/SSGIBlur.hlsl"));
 
-        Assert.That(Regex.Matches(shader, "DeclareDepthTexture.hlsl").Count, Is.EqualTo(3));
+        Assert.That(Regex.Matches(shader, "DeclareDepthTexture.hlsl").Count, Is.EqualTo(4));
         Assert.That(Regex.Matches(shader, "../GI/Commond.hlsl").Count, Is.EqualTo(3));
         Assert.That(shader, Does.Match(@"FragBlurH[\s\S]*SampleSSGIEdgeAwareFilter\s*\(\s*input\.texcoord\s*,\s*_BlurSpread\s*\)"));
         Assert.That(shader, Does.Match(@"FragBlurV[\s\S]*SampleSSGIEdgeAwareFilter\s*\(\s*input\.texcoord\s*,\s*_BlurSpread\s*\*\s*2\.0\s*\)"));
         Assert.That(feature, Does.Match(@"(?i)base edge-aware filter radius"));
         Assert.That(feature, Does.Match(@"material\s*,\s*1\s*\)[\s\S]*material\s*,\s*2\s*\)"));
-        Assert.That(feature, Does.Match(@"ConfigureInput\s*\(\s*ScriptableRenderPassInput\.Depth\s*\|\s*ScriptableRenderPassInput\.Color\s*\)"));
+        Assert.That(feature, Does.Match(@"ConfigureInput\s*\([\s\S]*ScriptableRenderPassInput\.Depth\s*\|[\s\S]*ScriptableRenderPassInput\.Color\s*\|[\s\S]*ScriptableRenderPassInput\.Motion\s*\)"));
+    }
+
+    [Test]
+    public void SSGI_UsesConfiguredRayCountWithoutAdaptiveRayCost()
+    {
+        string shader = ReadAsset("Scripts", "Shaders", "SSGI", "ScreenSpaceGlobalIllumination.shader");
+
+        Assert.That(shader, Does.Match(@"rayCount\s*=\s*clamp\s*\(\s*_SSGIRayCount\s*,\s*1\s*,\s*128\s*\)"));
+        Assert.That(shader, Does.Not.Contain("adaptiveRayCount"));
+        Assert.That(shader, Does.Not.Contain("_SSGIVarianceThreshold"));
+        Assert.That(shader, Does.Not.Contain("temporal.moments"));
     }
 
     [Test]
@@ -762,14 +812,30 @@ public class SSGIRefactorTests
     }
 
     [Test]
-    public void MainLightDirect_AddsPreviousIrradianceTimesAlbedoAtProjectedPixel()
+    public void MainLightDirect_ReprojectsWithPointDepthAndFillsDisocclusions()
     {
         string shader = ReadAsset("Scripts", "Shaders", "Objects", "MainLightDirect.shader");
 
         Assert.That(shader, Does.Contain("TEXTURE2D_X(_SSGIIrradianceTexture)"));
         Assert.That(shader, Does.Contain("_SSGIIrradianceValid"));
+        Assert.That(shader, Does.Contain("_SSGIPreviousViewProjectionMatrix"));
+        Assert.That(shader, Does.Contain("_SSGIPreviousWorldToCameraMatrix"));
+        Assert.That(shader, Does.Contain("_SSGIReprojectIrradiance"));
+        Assert.That(shader, Does.Contain("_SSGIDisocclusionFallback"));
         Assert.That(shader, Does.Match(@"screenUV\s*=\s*GetNormalizedScreenSpaceUV\s*\(\s*input\.positionCS\s*\)"));
-        Assert.That(shader, Does.Match(@"SAMPLE_TEXTURE2D_X\s*\(\s*_SSGIIrradianceTexture\s*,\s*sampler_LinearClamp\s*,\s*screenUV\s*\)\.rgb"));
-        Assert.That(shader, Does.Match(@"color\s*\+=\s*irradiance\s*\*\s*baseColor\.rgb"));
+        Assert.That(shader, Does.Match(@"requiresDepthValidation\s*=\s*_SSGIReprojectIrradiance\s*>\s*0\.5"));
+        Assert.That(shader, Does.Match(@"previousCS\s*=\s*mul\s*\("));
+        Assert.That(shader, Does.Match(@"previousUV\s*=\s*previousCS\.xy\s*/[\s\S]*max\s*\(\s*previousCS\.w"));
+        Assert.That(shader, Does.Match(@"reprojectedDepth\s*=\s*SAMPLE_TEXTURE2D_X\s*\([\s\S]*sampler_PointClamp\s*,[\s\S]*previousUV\s*\)\.a"));
+        Assert.That(shader, Does.Match(@"abs\s*\(\s*reprojectedDepth\s*-\s*expectedDepth\s*\)\s*<=\s*depthThreshold"));
+        Assert.That(shader, Does.Match(@"indirectConfidence\s*<=\s*0\.0\s*&&\s*_SSGIDisocclusionFallback\s*>\s*0\.0"));
+        Assert.That(shader, Does.Match(@"fallbackIrradiance\s*=\s*SAMPLE_TEXTURE2D_X\s*\([\s\S]*sampler_LinearClamp\s*,\s*screenUV\s*\)"));
+        Assert.That(shader, Does.Match(@"color\s*\+=\s*indirectIrradiance\s*\*\s*baseColor\.rgb\s*\*\s*indirectConfidence"));
+
+        string feature = ReadAsset("Scripts", "Runtime", "Features", "ScreenSpaceGlobalIlluminationFeature.cs");
+        Assert.That(feature, Does.Contain("_SSGIReprojectIrradiance"));
+        Assert.That(feature, Does.Contain("_SSGIDisocclusionFallback"));
+        Assert.That(feature, Does.Match(@"cameraMoved\s*=\s*state\.hasPreviousPose"));
+        Assert.That(feature, Does.Match(@"SetGlobalFloat\s*\(\s*ReprojectIrradianceID\s*,\s*cameraMoved\s*\?\s*1\.0f\s*:\s*0\.0f\s*\)"));
     }
 }

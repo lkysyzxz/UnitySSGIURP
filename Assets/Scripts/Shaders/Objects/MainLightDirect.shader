@@ -43,6 +43,11 @@ Shader "GIDev/URP/MainLightDirect"
             SAMPLER(sampler_MainTex);
             TEXTURE2D_X(_SSGIIrradianceTexture);
             float _SSGIIrradianceValid;
+            float _SSGIReprojectIrradiance;
+            float _SSGIDisocclusionFallback;
+            float _SSGIHistoryDepthThreshold;
+            float4x4 _SSGIPreviousViewProjectionMatrix;
+            float4x4 _SSGIPreviousWorldToCameraMatrix;
 
             struct Attributes
             {
@@ -100,9 +105,71 @@ Shader "GIDev/URP/MainLightDirect"
                 if (_SSGIIrradianceValid > 0.0)
                 {
                     float2 screenUV = GetNormalizedScreenSpaceUV(input.positionCS);
-                    half3 irradiance = SAMPLE_TEXTURE2D_X(
-                        _SSGIIrradianceTexture, sampler_LinearClamp, screenUV).rgb;
-                    color += irradiance * baseColor.rgb;
+                    bool requiresDepthValidation = _SSGIReprojectIrradiance > 0.5;
+                    half3 indirectIrradiance = 0.0;
+                    half indirectConfidence = 0.0;
+
+                    if (!requiresDepthValidation)
+                    {
+                        half4 irradianceDepth = SAMPLE_TEXTURE2D_X(
+                            _SSGIIrradianceTexture, sampler_LinearClamp, screenUV);
+                        if (irradianceDepth.a >= 0.0)
+                        {
+                            indirectIrradiance = irradianceDepth.rgb;
+                            indirectConfidence = 1.0;
+                        }
+                    }
+                    else
+                    {
+                        float4 previousCS = mul(
+                            _SSGIPreviousViewProjectionMatrix,
+                            float4(input.positionWS, 1.0));
+                        float2 previousUV = previousCS.xy /
+                            max(previousCS.w, 0.000001) * 0.5 + 0.5;
+                        bool previousUVValid = previousCS.w > 0.0 &&
+                            all(previousUV >= 0.0) && all(previousUV <= 1.0);
+
+                        if (previousUVValid)
+                        {
+                            half3 reprojectedIrradiance = SAMPLE_TEXTURE2D_X(
+                                _SSGIIrradianceTexture,
+                                sampler_LinearClamp,
+                                previousUV).rgb;
+                            float reprojectedDepth = SAMPLE_TEXTURE2D_X(
+                                _SSGIIrradianceTexture,
+                                sampler_PointClamp,
+                                previousUV).a;
+                            float expectedDepth = -mul(
+                                _SSGIPreviousWorldToCameraMatrix,
+                                float4(input.positionWS, 1.0)).z;
+                            float depthThreshold = max(
+                                _SSGIHistoryDepthThreshold, expectedDepth * 0.01);
+                            bool depthValid = reprojectedDepth >= 0.0 &&
+                                expectedDepth > 0.0 &&
+                                abs(reprojectedDepth - expectedDepth) <= depthThreshold;
+
+                            if (depthValid)
+                            {
+                                indirectIrradiance = reprojectedIrradiance;
+                                indirectConfidence = 1.0;
+                            }
+                        }
+
+                        if (indirectConfidence <= 0.0 && _SSGIDisocclusionFallback > 0.0)
+                        {
+                            half4 fallbackIrradiance = SAMPLE_TEXTURE2D_X(
+                                _SSGIIrradianceTexture, sampler_LinearClamp, screenUV);
+                            float fallbackDepth = SAMPLE_TEXTURE2D_X(
+                                _SSGIIrradianceTexture, sampler_PointClamp, screenUV).a;
+                            if (fallbackDepth >= 0.0)
+                            {
+                                indirectIrradiance = fallbackIrradiance.rgb;
+                                indirectConfidence = _SSGIDisocclusionFallback;
+                            }
+                        }
+                    }
+
+                    color += indirectIrradiance * baseColor.rgb * indirectConfidence;
                 }
 
                 return half4(color, baseColor.a);

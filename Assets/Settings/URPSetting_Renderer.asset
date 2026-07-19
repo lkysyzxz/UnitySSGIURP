@@ -90,20 +90,22 @@ MonoBehaviour:
   m_Script: {fileID: 11500000, guid: f6b8d2d2248146da8062ccd85f1e189a, type: 3}
   m_Name: ScreenSpaceGlobalIlluminationFeature
   m_EditorClassIdentifier: 
-  m_Active: 1
+  m_Active: 0
   settings:
     rayCount: 1
     sampleOffset: 0
-    maxSteps: 256
-    maxDistance: 256
+    maxSteps: 64
+    maxDistance: 20
     thickness: 0.1
     originBias: 0
     useHiZTracing: 0
     intensity: 1
-    blurSpread: 2
+    blurSpread: 1
     jitterDither: 0
-    temporalResponse: 0.002
+    temporalResponse: 0.02
     temporalDepthThreshold: 0.1
+    maxHistoryFrames: 64
+    disocclusionFallback: 0.181
   ssgiShader: {fileID: 4800000, guid: 9490a711bfc34f8cbeef660f439b2d0e, type: 3}
 --- !u!114 &8235197496059556877
 MonoBehaviour:

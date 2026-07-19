@@ -59,6 +59,15 @@ public class ScreenSpaceGlobalIlluminationFeature : ScriptableRendererFeature
         [Tooltip("Minimum linear eye-depth difference that rejects stale per-pixel history")]
         [Min(0.001f)]
         public float temporalDepthThreshold = 0.1f;
+
+        [Tooltip("Maximum number of valid reprojected samples before switching to the configured EMA response")]
+        [Range(2, 64)]
+        public int maxHistoryFrames = 32;
+
+        [Tooltip("Low-confidence previous-frame irradiance used to hide newly disoccluded black regions")]
+        [Range(0.0f, 1.0f)]
+        public float disocclusionFallback = 0.35f;
+
     }
 
     [SerializeField] private SSGISettings settings = new SSGISettings();
@@ -129,6 +138,8 @@ public class ScreenSpaceGlobalIlluminationFeature : ScriptableRendererFeature
         private RTHandle sourceHandle;
         private readonly Dictionary<int, CameraState> cameraStates = new Dictionary<int, CameraState>();
         private const int MaxCameraStates = 4;
+        private const int MotionHistoryFrameCap = 4;
+        private const int TemporalAlgorithmVersion = 4;
 
         private sealed class CameraState
         {
@@ -141,6 +152,8 @@ public class ScreenSpaceGlobalIlluminationFeature : ScriptableRendererFeature
             public Quaternion previousRotation;
             public bool hasPreviousConfiguration;
             public Matrix4x4 previousProjectionMatrix;
+            public Matrix4x4 previousViewProjectionMatrix;
+            public Matrix4x4 previousWorldToCameraMatrix;
             public int previousSettingsHash;
             public bool historyValid;
             public int historyCount;
@@ -174,7 +187,7 @@ public class ScreenSpaceGlobalIlluminationFeature : ScriptableRendererFeature
             }
         }
 
-        private static readonly ProfilingSampler profilingSampler =
+        private static readonly ProfilingSampler ssgiProfilingSampler =
             new ProfilingSampler("Screen Space Global Illumination");
 
         private static readonly int UVToViewPosID = Shader.PropertyToID("_UVToViewPos");
@@ -189,10 +202,16 @@ public class ScreenSpaceGlobalIlluminationFeature : ScriptableRendererFeature
         private static readonly int RadianceTextureID = Shader.PropertyToID("_SSGIRadianceTexture");
         private static readonly int IrradianceTextureID = Shader.PropertyToID("_SSGIIrradianceTexture");
         private static readonly int IrradianceValidID = Shader.PropertyToID("_SSGIIrradianceValid");
+        private static readonly int ReprojectIrradianceID = Shader.PropertyToID("_SSGIReprojectIrradiance");
+        private static readonly int DisocclusionFallbackID = Shader.PropertyToID("_SSGIDisocclusionFallback");
         private static readonly int HistoryTextureID = Shader.PropertyToID("_SSGIHistoryTexture");
         private static readonly int HistoryValidID = Shader.PropertyToID("_SSGIHistoryValid");
         private static readonly int HistoryWeightID = Shader.PropertyToID("_SSGIHistoryWeight");
         private static readonly int HistoryDepthThresholdID = Shader.PropertyToID("_SSGIHistoryDepthThreshold");
+        private static readonly int MaxHistoryFramesID = Shader.PropertyToID("_SSGIMaxHistoryFrames");
+        private static readonly int HistoryFrameCountID = Shader.PropertyToID("_SSGIHistoryFrameCount");
+        private static readonly int PreviousViewProjectionMatrixID = Shader.PropertyToID("_SSGIPreviousViewProjectionMatrix");
+        private static readonly int PreviousWorldToCameraMatrixID = Shader.PropertyToID("_SSGIPreviousWorldToCameraMatrix");
         private const string JitterKeyword = "_JITTER_ON";
         private const string HiZKeyword = "_SSGI_HIZ_ON";
 
@@ -206,7 +225,10 @@ public class ScreenSpaceGlobalIlluminationFeature : ScriptableRendererFeature
             material = mat;
             settings = ssgiSettings;
             sourceHandle = source;
-            ConfigureInput(ScriptableRenderPassInput.Depth | ScriptableRenderPassInput.Color);
+            ConfigureInput(
+                ScriptableRenderPassInput.Depth |
+                ScriptableRenderPassInput.Color |
+                ScriptableRenderPassInput.Motion);
         }
 
         public override void OnCameraSetup(CommandBuffer cmd, ref RenderingData renderingData)
@@ -253,6 +275,7 @@ public class ScreenSpaceGlobalIlluminationFeature : ScriptableRendererFeature
             RenderingUtils.ReAllocateIfNeeded(ref state.blurB, desc, FilterMode.Bilinear, TextureWrapMode.Clamp, name: "_SSGI_BlurB_" + suffix);
             RenderingUtils.ReAllocateIfNeeded(ref state.historyA, desc, FilterMode.Bilinear, TextureWrapMode.Clamp, name: "_SSGI_HistoryA_" + suffix);
             RenderingUtils.ReAllocateIfNeeded(ref state.historyB, desc, FilterMode.Bilinear, TextureWrapMode.Clamp, name: "_SSGI_HistoryB_" + suffix);
+
             RenderingUtils.ReAllocateIfNeeded(ref state.irradianceRT, desc, FilterMode.Bilinear, TextureWrapMode.Clamp, name: "_SSGI_Irradiance_" + suffix);
         }
 
@@ -265,16 +288,27 @@ public class ScreenSpaceGlobalIlluminationFeature : ScriptableRendererFeature
                 return;
             }
 
-            bool poseMatches = state.hasPreviousPose &&
-                state.previousPosition == cam.transform.position &&
-                state.previousRotation == cam.transform.rotation;
             bool configurationMatches = state.hasPreviousConfiguration &&
-                state.previousProjectionMatrix == cam.nonJitteredProjectionMatrix &&
                 state.previousSettingsHash == ComputeSettingsHash(settings);
-            bool irradianceValid = state.historyValid && poseMatches && configurationMatches;
+            bool irradianceValid = state.historyValid && configurationMatches;
+            bool cameraMoved = state.hasPreviousPose &&
+                (state.previousPosition != cam.transform.position ||
+                 state.previousRotation != cam.transform.rotation ||
+                 state.previousProjectionMatrix != cam.nonJitteredProjectionMatrix);
 
             cmd.SetGlobalFloat(IrradianceValidID, irradianceValid ? 1.0f : 0.0f);
+            cmd.SetGlobalFloat(ReprojectIrradianceID, cameraMoved ? 1.0f : 0.0f);
+            cmd.SetGlobalFloat(DisocclusionFallbackID,
+                IsFinite(settings.disocclusionFallback)
+                    ? Mathf.Clamp01(settings.disocclusionFallback)
+                    : 0.35f);
             cmd.SetGlobalTexture(IrradianceTextureID, state.irradianceRT);
+            cmd.SetGlobalFloat(HistoryDepthThresholdID,
+                IsFinite(settings.temporalDepthThreshold)
+                    ? Mathf.Max(settings.temporalDepthThreshold, 0.001f)
+                    : 0.1f);
+            cmd.SetGlobalMatrix(PreviousViewProjectionMatrixID, state.previousViewProjectionMatrix);
+            cmd.SetGlobalMatrix(PreviousWorldToCameraMatrixID, state.previousWorldToCameraMatrix);
         }
 
         public override void Execute(ScriptableRenderContext context, ref RenderingData renderingData)
@@ -288,22 +322,28 @@ public class ScreenSpaceGlobalIlluminationFeature : ScriptableRendererFeature
 
             CommandBuffer cmd = CommandBufferPool.Get("SSGI Pass");
             bool isNewLogicalFrame = state.lastUpdateFrame != Time.frameCount;
-            bool poseChanged = !state.hasPreviousPose ||
-                state.previousPosition != cam.transform.position ||
-                state.previousRotation != cam.transform.rotation;
             Matrix4x4 projectionMatrix = cam.nonJitteredProjectionMatrix;
+            bool viewChanged = !state.hasPreviousPose ||
+                state.previousPosition != cam.transform.position ||
+                state.previousRotation != cam.transform.rotation ||
+                state.previousProjectionMatrix != projectionMatrix;
             int settingsHash = ComputeSettingsHash(settings);
             bool configurationChanged = !state.hasPreviousConfiguration ||
-                state.previousProjectionMatrix != projectionMatrix ||
                 state.previousSettingsHash != settingsHash;
             int rayCount = Mathf.Clamp(settings.rayCount, 1, 128);
             int baseSampleOffset = Mathf.Clamp(settings.sampleOffset, 0, 65535);
+            Matrix4x4 currentWorldToCameraMatrix = renderingData.cameraData.GetViewMatrix();
+            Matrix4x4 currentViewProjectionMatrix =
+                renderingData.cameraData.GetGPUProjectionMatrixNoJitter() * currentWorldToCameraMatrix;
 
-            bool resetHistory = poseChanged || configurationChanged;
+            bool resetHistory = configurationChanged;
             if (resetHistory)
                 ResetTemporalState(state);
+            else if (viewChanged && state.historyValid)
+                state.historyCount = Mathf.Min(
+                    state.historyCount, MotionHistoryFrameCap);
 
-            bool accumulate = resetHistory || isNewLogicalFrame;
+            bool accumulate = resetHistory || isNewLogicalFrame || viewChanged;
             if (accumulate)
             {
                 if (!resetHistory && state.historyValid)
@@ -312,7 +352,7 @@ public class ScreenSpaceGlobalIlluminationFeature : ScriptableRendererFeature
                     state.sampleOffset = baseSampleOffset;
             }
 
-            using (new ProfilingScope(cmd, profilingSampler))
+            using (new ProfilingScope(cmd, ssgiProfilingSampler))
             {
                 float farClip = Mathf.Max(cam.farClipPlane, 0.1f);
                 float maxDistance = IsFinite(settings.maxDistance)
@@ -336,6 +376,7 @@ public class ScreenSpaceGlobalIlluminationFeature : ScriptableRendererFeature
                 float temporalDepthThreshold = IsFinite(settings.temporalDepthThreshold)
                     ? Mathf.Max(settings.temporalDepthThreshold, 0.001f)
                     : 0.1f;
+                int maxHistoryFrames = Mathf.Clamp(settings.maxHistoryFrames, 2, 64);
 
                 material.SetVector(UVToViewPosID, GIUtility.ComputeUVToViewPos(cam));
                 material.SetInt(RayCountID, rayCount);
@@ -347,6 +388,10 @@ public class ScreenSpaceGlobalIlluminationFeature : ScriptableRendererFeature
                 material.SetFloat(IntensityID, intensity);
                 material.SetFloat(BlurSpreadID, blurSpread);
                 material.SetFloat(HistoryDepthThresholdID, temporalDepthThreshold);
+                material.SetFloat(MaxHistoryFramesID, maxHistoryFrames);
+                material.SetFloat(HistoryFrameCountID,
+                    Mathf.Min(state.historyCount, maxHistoryFrames));
+                material.SetMatrix(PreviousWorldToCameraMatrixID, state.previousWorldToCameraMatrix);
 
                 if (settings.jitterDither)
                     material.EnableKeyword(JitterKeyword);
@@ -363,10 +408,11 @@ public class ScreenSpaceGlobalIlluminationFeature : ScriptableRendererFeature
 
                 if (accumulate)
                 {
-                    Blitter.BlitCameraTexture(cmd, sourceHandle, state.blurA, material, 0);
                     cmd.SetGlobalTexture(HistoryTextureID, state.HistoryRead);
                     material.SetFloat(HistoryValidID, state.historyValid ? 1.0f : 0.0f);
                     material.SetFloat(HistoryWeightID, temporalResponse);
+
+                    Blitter.BlitCameraTexture(cmd, sourceHandle, state.blurA, material, 0);
                     Blitter.BlitCameraTexture(cmd, state.blurA, state.HistoryWrite, material, 3);
                     Blitter.BlitCameraTexture(cmd, state.HistoryWrite, state.blurB, material, 1);
                     Blitter.BlitCameraTexture(cmd, state.blurB, state.irradianceRT, material, 2);
@@ -390,6 +436,8 @@ public class ScreenSpaceGlobalIlluminationFeature : ScriptableRendererFeature
                 state.previousRotation = cam.transform.rotation;
                 state.hasPreviousConfiguration = true;
                 state.previousProjectionMatrix = projectionMatrix;
+                state.previousViewProjectionMatrix = currentViewProjectionMatrix;
+                state.previousWorldToCameraMatrix = currentWorldToCameraMatrix;
                 state.previousSettingsHash = settingsHash;
                 state.lastUpdateFrame = Time.frameCount;
             }
@@ -454,6 +502,7 @@ public class ScreenSpaceGlobalIlluminationFeature : ScriptableRendererFeature
             unchecked
             {
                 int hash = 17;
+                hash = hash * 31 + TemporalAlgorithmVersion;
                 hash = hash * 31 + value.rayCount;
                 hash = hash * 31 + value.sampleOffset;
                 hash = hash * 31 + value.maxSteps;
@@ -466,6 +515,7 @@ public class ScreenSpaceGlobalIlluminationFeature : ScriptableRendererFeature
                 hash = hash * 31 + (value.jitterDither ? 1 : 0);
                 hash = hash * 31 + value.temporalResponse.GetHashCode();
                 hash = hash * 31 + value.temporalDepthThreshold.GetHashCode();
+                hash = hash * 31 + value.maxHistoryFrames;
                 return hash;
             }
         }

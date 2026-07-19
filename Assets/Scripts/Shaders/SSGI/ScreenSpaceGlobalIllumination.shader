@@ -121,7 +121,7 @@ Shader "Hidden/SSGI/ScreenSpaceGlobalIllumination"
             #include "Packages/com.unity.render-pipelines.core/Runtime/Utilities/Blit.hlsl"
             #include "Packages/com.unity.render-pipelines.universal/ShaderLibrary/DeclareDepthTexture.hlsl"
             #include "../GI/Commond.hlsl"
-            #include "../GI/Blur.hlsl"
+            #include "../GI/SSGIBlur.hlsl"
 
             float4 FragBlurH(Varyings input) : SV_Target
             {
@@ -146,7 +146,7 @@ Shader "Hidden/SSGI/ScreenSpaceGlobalIllumination"
             #include "Packages/com.unity.render-pipelines.core/Runtime/Utilities/Blit.hlsl"
             #include "Packages/com.unity.render-pipelines.universal/ShaderLibrary/DeclareDepthTexture.hlsl"
             #include "../GI/Commond.hlsl"
-            #include "../GI/Blur.hlsl"
+            #include "../GI/SSGIBlur.hlsl"
 
             float4 FragBlurV(Varyings input) : SV_Target
             {
@@ -169,32 +169,27 @@ Shader "Hidden/SSGI/ScreenSpaceGlobalIllumination"
             #include "Packages/com.unity.render-pipelines.core/ShaderLibrary/Common.hlsl"
             #include "Packages/com.unity.render-pipelines.universal/ShaderLibrary/Core.hlsl"
             #include "Packages/com.unity.render-pipelines.core/Runtime/Utilities/Blit.hlsl"
-
-            TEXTURE2D_X(_SSGIHistoryTexture);
-            float _SSGIHistoryValid;
-            float _SSGIHistoryWeight;
-            float _SSGIHistoryDepthThreshold;
+            #include "Packages/com.unity.render-pipelines.universal/ShaderLibrary/DeclareDepthTexture.hlsl"
+            #include "../GI/Temporal.hlsl"
 
             float4 FragAccumulate(Varyings input) : SV_Target
             {
                 float2 uv = input.texcoord;
                 float4 current = SAMPLE_TEXTURE2D_X(_BlitTexture, sampler_LinearClamp, uv);
-                if (_SSGIHistoryValid <= 0.0)
+                if (current.a < 0.0)
                     return current;
 
-                float4 history = SAMPLE_TEXTURE2D_X(_SSGIHistoryTexture, sampler_LinearClamp, uv);
-                bool currentHasGeometry = current.a >= 0.0;
-                bool historyHasGeometry = history.a >= 0.0;
-                if (currentHasGeometry != historyHasGeometry || !currentHasGeometry)
+                float rawDepth = SampleSceneDepth(uv);
+                if (!IsSSGIRawDepthValid(rawDepth))
                     return current;
 
-                float currentDepth = current.a;
-                float historyDepth = history.a;
-                float depthThreshold = max(_SSGIHistoryDepthThreshold, currentDepth * 0.01);
-                if (abs(currentDepth - historyDepth) > depthThreshold)
+                SSGITemporalHistory temporal = GetSSGITemporalHistory(uv, rawDepth);
+                if (!temporal.valid)
                     return current;
 
-                float3 accumulated = history.rgb + (current.rgb - history.rgb) * _SSGIHistoryWeight;
+                float currentFrameWeight = GetSSGICurrentFrameWeight();
+                float3 accumulated = lerp(
+                    temporal.irradianceDepth.rgb, current.rgb, currentFrameWeight);
                 return float4(accumulated, current.a);
             }
             ENDHLSL
