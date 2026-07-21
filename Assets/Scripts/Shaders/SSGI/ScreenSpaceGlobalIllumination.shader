@@ -188,8 +188,7 @@ Shader "Hidden/SSGI/ScreenSpaceGlobalIllumination"
                     return current;
 
                 float currentFrameWeight = GetSSGICurrentFrameWeight();
-                float3 accumulated = lerp(
-                    temporal.irradianceDepth.rgb, current.rgb, currentFrameWeight);
+                float3 accumulated = lerp(temporal.irradianceDepth.rgb, current.rgb, currentFrameWeight);
                 return float4(accumulated, current.a);
             }
             ENDHLSL

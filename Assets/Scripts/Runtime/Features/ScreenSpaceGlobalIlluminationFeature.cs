@@ -61,7 +61,7 @@ public class ScreenSpaceGlobalIlluminationFeature : ScriptableRendererFeature
         public float temporalDepthThreshold = 0.1f;
 
         [Tooltip("Maximum number of valid reprojected samples before switching to the configured EMA response")]
-        [Range(2, 64)]
+        [Range(2, 512)]
         public int maxHistoryFrames = 32;
 
         [Tooltip("Low-confidence previous-frame irradiance used to hide newly disoccluded black regions")]
@@ -376,7 +376,7 @@ public class ScreenSpaceGlobalIlluminationFeature : ScriptableRendererFeature
                 float temporalDepthThreshold = IsFinite(settings.temporalDepthThreshold)
                     ? Mathf.Max(settings.temporalDepthThreshold, 0.001f)
                     : 0.1f;
-                int maxHistoryFrames = Mathf.Clamp(settings.maxHistoryFrames, 2, 64);
+                int maxHistoryFrames = Mathf.Clamp(settings.maxHistoryFrames, 2, 512);
 
                 material.SetVector(UVToViewPosID, GIUtility.ComputeUVToViewPos(cam));
                 material.SetInt(RayCountID, rayCount);
