@@ -4,7 +4,7 @@
 #include "Jitter.hlsl"
 #include "HiZUtility.hlsl"
 
-#define SCREEN_SPACE_RAY_BINARY_STEPS 10
+#define SCREEN_SPACE_RAY_BINARY_STEPS 16
 #define SCREEN_SPACE_RAY_NEAR_EPSILON 0.0001
 
 struct ScreenSpaceRayHit
@@ -19,6 +19,12 @@ float2 ProjectVStoUV(float3 vsPos)
 {
     float4 clip = mul(UNITY_MATRIX_P, float4(vsPos.xy, -vsPos.z, 1.0));
     float2 uv = (clip.xy / clip.w) * 0.5 + 0.5;
+#if defined(UNITY_UV_STARTS_AT_TOP)
+    // ComputeViewSpacePosition flips texture-space Y when reconstructing a
+    // view-space point. Apply the inverse transform here; otherwise every ray
+    // tests depth at the vertically mirrored screen position.
+    uv.y = 1.0 - uv.y;
+#endif
     return uv;
 }
 
@@ -69,7 +75,7 @@ bool ClipScreenSpaceRaySegment(inout float3 rayStartVS, inout float3 rayEndVS)
         return false;
 
     float3 ray = rayEndVS - rayStartVS;
-    if (dot(ray, ray) <= SCREEN_SPACE_RAY_NEAR_EPSILON * SCREEN_SPACE_RAY_NEAR_EPSILON)
+    if (dot(ray, ray) <= nearPlane * nearPlane)
         return false;
 
     if (rayEndVS.z <= nearPlane)
@@ -210,19 +216,19 @@ ScreenSpaceRayHit MarchScreenSpaceRayBinary(float3 rayStartVS, float3 rayEndVS,
                                             int maxSteps, float thickness, int binarySteps)
 {
     ScreenSpaceRayHit result = (ScreenSpaceRayHit)0;
+    if (!ClipScreenSpaceRaySegment(rayStartVS, rayEndVS))
+        return result;
 
     float2 startUV = ProjectVStoUV(rayStartVS);
     float2 endUV   = ProjectVStoUV(rayEndVS);
 
     float invZ0 = 1.0 / rayStartVS.z;
     float invZ1 = 1.0 / rayEndVS.z;
-    // if (!ClipScreenSpaceRayToViewport(startUV, endUV, invZ0, invZ1))
-    //     return result;
 
     float2 deltaUV      = endUV - startUV;
     float2 deltaPixel   = deltaUV * _ScreenParams.xy;
     float  maxPixelSpan = max(abs(deltaPixel.x), abs(deltaPixel.y));
-    int    safeMaxSteps = clamp(maxSteps, 1, 256);
+    int    safeMaxSteps = clamp(maxSteps, 1, 2048);
     int    numSteps     = maxPixelSpan < 1.0
         ? min(2, safeMaxSteps)
         : (int)clamp(ceil(maxPixelSpan), 1.0, (float)safeMaxSteps);
@@ -235,7 +241,15 @@ ScreenSpaceRayHit MarchScreenSpaceRayBinary(float3 rayStartVS, float3 rayEndVS,
     float  prevInvZ    = invZ0;
     float2 currentUV   = startUV;
     float  currentInvZ = invZ0;
+    // bool   hasFrontSample = false;
     bool   crossed     = false;
+
+    // if (currentUV.x >= 0.0 && currentUV.x <= 1.0 &&
+    //     currentUV.y >= 0.0 && currentUV.y <= 1.0)
+    // {
+    //     float startSceneZ = LinearEyeDepth(SampleSceneDepth(currentUV), _ZBufferParams);
+    //     hasFrontSample = (1.0 / currentInvZ) <= startSceneZ;
+    // }
 
     #if defined(_JITTER_ON)
     if (maxPixelSpan >= 1.0)
@@ -262,6 +276,11 @@ ScreenSpaceRayHit MarchScreenSpaceRayBinary(float3 rayStartVS, float3 rayEndVS,
         float sceneZ = LinearEyeDepth(SampleSceneDepth(currentUV), _ZBufferParams);
         if ((1.0 / currentInvZ) > sceneZ)
         {
+            // if (hasFrontSample)
+            // {
+            //     crossed = true;
+            //     break;
+            // }
             crossed = true;
             break;
         }

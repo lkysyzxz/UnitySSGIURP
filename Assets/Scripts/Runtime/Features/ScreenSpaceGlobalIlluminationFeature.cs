@@ -19,7 +19,7 @@ public class ScreenSpaceGlobalIlluminationFeature : ScriptableRendererFeature
         public int sampleOffset = 0;
 
         [Tooltip("Maximum number of ray march steps")]
-        [Range(1, 256)]
+        [Range(1, 2048)]
         public int maxSteps = 32;
 
         [Tooltip("Maximum ray travel distance")]
@@ -30,7 +30,7 @@ public class ScreenSpaceGlobalIlluminationFeature : ScriptableRendererFeature
         [Range(0.001f, 1.0f)]
         public float thickness = 0.1f;
 
-        [Tooltip("View-space offset along the surface normal used to start rays")]
+        [Tooltip("View-space offset along the surface normal used to prevent rays from intersecting their source surface")]
         [Range(0.0f, 0.1f)]
         public float originBias = 0.01f;
 
@@ -52,22 +52,36 @@ public class ScreenSpaceGlobalIlluminationFeature : ScriptableRendererFeature
         public bool jitterDither = true;
 
         [Header("Temporal")]
-        [Tooltip("Current-frame weight used by the fixed exponential moving average")]
+        [Tooltip("Current-frame weight used after a pixel reaches the temporal accumulation cap")]
         [Range(0.001f, 1.0f)]
-        public float temporalResponse = 0.05f;
+        public float temporalResponse = 0.08f;
+
+        [Tooltip("Maximum number of Monte Carlo frames accumulated per pixel before switching to the fixed temporal response")]
+        [Range(2, 2048)]
+        public int maxHistoryFrames = 8;
 
         [Tooltip("Minimum linear eye-depth difference that rejects stale per-pixel history")]
         [Min(0.001f)]
         public float temporalDepthThreshold = 0.1f;
 
-        [Tooltip("Maximum number of valid reprojected samples before switching to the configured EMA response")]
-        [Range(2, 512)]
-        public int maxHistoryFrames = 32;
-
         [Tooltip("Low-confidence previous-frame irradiance used to hide newly disoccluded black regions")]
         [Range(0.0f, 1.0f)]
         public float disocclusionFallback = 0.35f;
 
+        [Header("Resolution")]
+        [Tooltip("Run the SSGI trace, blur and temporal passes at half resolution and upscale in the Combine pass (UnitySSGIURP style)")]
+        public bool halfResolution = true;
+
+        [Header("Sampling")]
+        [Tooltip("Hemisphere RNG used by the trace pass. R2 keeps the legacy low-discrepancy sequence; Hash matches UnitySSGIURP's hash + frame-counter generator")]
+        public SSGIRngMode rngMode = SSGIRngMode.R2;
+
+    }
+
+    public enum SSGIRngMode
+    {
+        R2 = 0,
+        Hash = 1,
     }
 
     [SerializeField] private SSGISettings settings = new SSGISettings();
@@ -75,6 +89,7 @@ public class ScreenSpaceGlobalIlluminationFeature : ScriptableRendererFeature
 
     private Material ssgiMaterial;
     private IrradianceHistorySetupPass irradianceHistorySetupPass;
+    private ForwardGBufferPass forwardGBufferPass;
     private ScreenSpaceGlobalIlluminationPass ssgiPass;
 
     public override void Create()
@@ -83,6 +98,8 @@ public class ScreenSpaceGlobalIlluminationFeature : ScriptableRendererFeature
         ssgiPass.renderPassEvent = RenderPassEvent.BeforeRenderingPostProcessing;
         irradianceHistorySetupPass = new IrradianceHistorySetupPass(ssgiPass);
         irradianceHistorySetupPass.renderPassEvent = RenderPassEvent.BeforeRenderingOpaques;
+        forwardGBufferPass = new ForwardGBufferPass();
+        forwardGBufferPass.renderPassEvent = RenderPassEvent.AfterRenderingOpaques;
     }
 
     public override void SetupRenderPasses(ScriptableRenderer renderer, in RenderingData renderingData)
@@ -98,14 +115,169 @@ public class ScreenSpaceGlobalIlluminationFeature : ScriptableRendererFeature
             ssgiMaterial = CoreUtils.CreateEngineMaterial(ssgiShader);
         if (ssgiMaterial == null) return;
         renderer.EnqueuePass(irradianceHistorySetupPass);
+        renderer.EnqueuePass(forwardGBufferPass);
         renderer.EnqueuePass(ssgiPass);
     }
 
     protected override void Dispose(bool disposing)
     {
+        forwardGBufferPass?.Dispose();
         ssgiPass?.Dispose();
         CoreUtils.Destroy(ssgiMaterial);
         ssgiMaterial = null;
+    }
+
+    internal class ForwardGBufferPass : ScriptableRenderPass
+    {
+        private const string ProfilerTag = "SSGI Forward GBuffer";
+        private const string AlbedoTextureName = "_SSGIGBufferAlbedo";
+        private const string MaterialTextureName = "_SSGIGBufferMaterial";
+        private const string NormalTextureName = "_SSGIGBufferNormalWS";
+        private const string PositionTextureName = "_SSGIGBufferPositionWS";
+        private const string DepthTextureName = "_SSGIGBufferDepth";
+
+        private static readonly ShaderTagId ForwardGBufferShaderTag =
+            new ShaderTagId("SSGIForwardGBuffer");
+        private static readonly ProfilingSampler ProfilingSampler =
+            new ProfilingSampler(ProfilerTag);
+        private static readonly int AlbedoTextureID = Shader.PropertyToID(AlbedoTextureName);
+        private static readonly int MaterialTextureID = Shader.PropertyToID(MaterialTextureName);
+        private static readonly int NormalTextureID = Shader.PropertyToID(NormalTextureName);
+        private static readonly int PositionTextureID = Shader.PropertyToID(PositionTextureName);
+
+        private FilteringSettings filteringSettings =
+            new FilteringSettings(RenderQueueRange.opaque);
+        private RenderStateBlock renderStateBlock =
+            new RenderStateBlock(RenderStateMask.Depth);
+        private readonly RTHandle[] gbufferAttachments = new RTHandle[4];
+
+        private RTHandle albedoTexture;
+        private RTHandle materialTexture;
+        private RTHandle normalTexture;
+        private RTHandle positionTexture;
+        private RTHandle depthTexture;
+
+        public ForwardGBufferPass()
+        {
+            ConfigureInput(ScriptableRenderPassInput.Depth);
+        }
+
+        public override void OnCameraSetup(CommandBuffer cmd, ref RenderingData renderingData)
+        {
+            RenderTextureDescriptor descriptor = renderingData.cameraData.cameraTargetDescriptor;
+            descriptor.depthBufferBits = 0;
+            descriptor.stencilFormat = GraphicsFormat.None;
+            descriptor.msaaSamples = 1;
+            descriptor.bindMS = false;
+
+            descriptor.graphicsFormat = QualitySettings.activeColorSpace == ColorSpace.Linear
+                ? GraphicsFormat.R8G8B8A8_SRGB
+                : GraphicsFormat.R8G8B8A8_UNorm;
+            RenderingUtils.ReAllocateIfNeeded(
+                ref albedoTexture, descriptor, FilterMode.Point, TextureWrapMode.Clamp,
+                name: AlbedoTextureName);
+
+            descriptor.graphicsFormat = GraphicsFormat.R8G8B8A8_UNorm;
+            RenderingUtils.ReAllocateIfNeeded(
+                ref materialTexture, descriptor, FilterMode.Point, TextureWrapMode.Clamp,
+                name: MaterialTextureName);
+
+            descriptor.graphicsFormat = GraphicsFormat.R16G16B16A16_SFloat;
+            RenderingUtils.ReAllocateIfNeeded(
+                ref normalTexture, descriptor, FilterMode.Point, TextureWrapMode.Clamp,
+                name: NormalTextureName);
+            RenderingUtils.ReAllocateIfNeeded(
+                ref positionTexture, descriptor, FilterMode.Point, TextureWrapMode.Clamp,
+                name: PositionTextureName);
+
+            gbufferAttachments[0] = albedoTexture;
+            gbufferAttachments[1] = materialTexture;
+            gbufferAttachments[2] = normalTexture;
+            gbufferAttachments[3] = positionTexture;
+
+            cmd.SetGlobalTexture(AlbedoTextureID, albedoTexture);
+            cmd.SetGlobalTexture(MaterialTextureID, materialTexture);
+            cmd.SetGlobalTexture(NormalTextureID, normalTexture);
+            cmd.SetGlobalTexture(PositionTextureID, positionTexture);
+
+            bool isOpenGL =
+                SystemInfo.graphicsDeviceType == GraphicsDeviceType.OpenGLES3 ||
+                SystemInfo.graphicsDeviceType == GraphicsDeviceType.OpenGLCore;
+            bool canReuseCameraDepth =
+                !isOpenGL &&
+                (renderingData.cameraData.renderType == CameraRenderType.Base ||
+                 renderingData.cameraData.clearDepth) &&
+                renderingData.cameraData.cameraTargetDescriptor.msaaSamples == descriptor.msaaSamples;
+
+            if (canReuseCameraDepth)
+            {
+                ConfigureTarget(
+                    gbufferAttachments,
+                    renderingData.cameraData.renderer.cameraDepthTargetHandle);
+                ConfigureClear(ClearFlag.Color, Color.clear);
+                renderStateBlock.depthState = new DepthState(false, CompareFunction.Equal);
+            }
+            else
+            {
+                RenderTextureDescriptor depthDescriptor =
+                    renderingData.cameraData.cameraTargetDescriptor;
+                depthDescriptor.msaaSamples = 1;
+                depthDescriptor.bindMS = false;
+                depthDescriptor.graphicsFormat = GraphicsFormat.None;
+                RenderingUtils.ReAllocateIfNeeded(
+                    ref depthTexture, depthDescriptor, FilterMode.Point, TextureWrapMode.Clamp,
+                    name: DepthTextureName);
+
+                ConfigureTarget(gbufferAttachments, depthTexture);
+                ConfigureClear(ClearFlag.Color | ClearFlag.Depth, Color.clear);
+                renderStateBlock.depthState = new DepthState(true, CompareFunction.LessEqual);
+            }
+        }
+
+        public override void Execute(
+            ScriptableRenderContext context,
+            ref RenderingData renderingData)
+        {
+            SortingCriteria sortingCriteria =
+                renderingData.cameraData.defaultOpaqueSortFlags;
+            DrawingSettings drawingSettings = CreateDrawingSettings(
+                ForwardGBufferShaderTag,
+                ref renderingData,
+                sortingCriteria);
+
+            CommandBuffer cmd = CommandBufferPool.Get(ProfilerTag);
+            using (new ProfilingScope(cmd, ProfilingSampler))
+            {
+                context.ExecuteCommandBuffer(cmd);
+                cmd.Clear();
+                context.DrawRenderers(
+                    renderingData.cullResults,
+                    ref drawingSettings,
+                    ref filteringSettings,
+                    ref renderStateBlock);
+            }
+
+            context.ExecuteCommandBuffer(cmd);
+            CommandBufferPool.Release(cmd);
+        }
+
+        public override void OnCameraCleanup(CommandBuffer cmd)
+        {
+        }
+
+        public void Dispose()
+        {
+            albedoTexture?.Release();
+            materialTexture?.Release();
+            normalTexture?.Release();
+            positionTexture?.Release();
+            depthTexture?.Release();
+            albedoTexture = null;
+            materialTexture = null;
+            normalTexture = null;
+            positionTexture = null;
+            depthTexture = null;
+        }
     }
 
     internal class IrradianceHistorySetupPass : ScriptableRenderPass
@@ -138,8 +310,7 @@ public class ScreenSpaceGlobalIlluminationFeature : ScriptableRendererFeature
         private RTHandle sourceHandle;
         private readonly Dictionary<int, CameraState> cameraStates = new Dictionary<int, CameraState>();
         private const int MaxCameraStates = 4;
-        private const int MotionHistoryFrameCap = 4;
-        private const int TemporalAlgorithmVersion = 4;
+        private const int TemporalAlgorithmVersion = 14;
 
         private sealed class CameraState
         {
@@ -156,34 +327,46 @@ public class ScreenSpaceGlobalIlluminationFeature : ScriptableRendererFeature
             public Matrix4x4 previousWorldToCameraMatrix;
             public int previousSettingsHash;
             public bool historyValid;
-            public int historyCount;
             public int sampleOffset;
             public int lastUpdateFrame = -1;
             public int historyReadIndex;
             public RTHandle radianceRT;
+            public RTHandle currentIrradianceRT;
             public RTHandle blurA;
             public RTHandle blurB;
             public RTHandle historyA;
             public RTHandle historyB;
-            public RTHandle irradianceRT;
+            public RTHandle historySampleA;
+            public RTHandle historySampleB;
+            public RTHandle applyRT;
 
             public RTHandle HistoryRead => historyReadIndex == 0 ? historyA : historyB;
             public RTHandle HistoryWrite => historyReadIndex == 0 ? historyB : historyA;
+            public RTHandle HistorySampleRead =>
+                historyReadIndex == 0 ? historySampleA : historySampleB;
+            public RTHandle HistorySampleWrite =>
+                historyReadIndex == 0 ? historySampleB : historySampleA;
 
             public void Release()
             {
                 radianceRT?.Release();
+                currentIrradianceRT?.Release();
                 blurA?.Release();
                 blurB?.Release();
                 historyA?.Release();
                 historyB?.Release();
-                irradianceRT?.Release();
+                historySampleA?.Release();
+                historySampleB?.Release();
+                applyRT?.Release();
                 radianceRT = null;
+                currentIrradianceRT = null;
                 blurA = null;
                 blurB = null;
                 historyA = null;
                 historyB = null;
-                irradianceRT = null;
+                historySampleA = null;
+                historySampleB = null;
+                applyRT = null;
             }
         }
 
@@ -201,19 +384,29 @@ public class ScreenSpaceGlobalIlluminationFeature : ScriptableRendererFeature
         private static readonly int BlurSpreadID = Shader.PropertyToID("_BlurSpread");
         private static readonly int RadianceTextureID = Shader.PropertyToID("_SSGIRadianceTexture");
         private static readonly int IrradianceTextureID = Shader.PropertyToID("_SSGIIrradianceTexture");
+        private static readonly int PreviousIrradianceValidID =
+            Shader.PropertyToID("_SSGIPreviousIrradianceValid");
         private static readonly int IrradianceValidID = Shader.PropertyToID("_SSGIIrradianceValid");
         private static readonly int ReprojectIrradianceID = Shader.PropertyToID("_SSGIReprojectIrradiance");
         private static readonly int DisocclusionFallbackID = Shader.PropertyToID("_SSGIDisocclusionFallback");
         private static readonly int HistoryTextureID = Shader.PropertyToID("_SSGIHistoryTexture");
+        private static readonly int HistorySampleTextureID =
+            Shader.PropertyToID("_SSGIHistorySampleTexture");
         private static readonly int HistoryValidID = Shader.PropertyToID("_SSGIHistoryValid");
         private static readonly int HistoryWeightID = Shader.PropertyToID("_SSGIHistoryWeight");
+        private static readonly int MaxHistoryFramesID =
+            Shader.PropertyToID("_SSGIMaxHistoryFrames");
         private static readonly int HistoryDepthThresholdID = Shader.PropertyToID("_SSGIHistoryDepthThreshold");
-        private static readonly int MaxHistoryFramesID = Shader.PropertyToID("_SSGIMaxHistoryFrames");
-        private static readonly int HistoryFrameCountID = Shader.PropertyToID("_SSGIHistoryFrameCount");
         private static readonly int PreviousViewProjectionMatrixID = Shader.PropertyToID("_SSGIPreviousViewProjectionMatrix");
         private static readonly int PreviousWorldToCameraMatrixID = Shader.PropertyToID("_SSGIPreviousWorldToCameraMatrix");
+        private static readonly int IrradianceTexelSizeID = Shader.PropertyToID("_SSGIIrradianceTexture_TexelSize");
+        private static readonly int TraceSizeID = Shader.PropertyToID("_SSGITraceSize");
+        private static readonly int HalfResolutionID = Shader.PropertyToID("_SSGIHalfResolution");
+        private static readonly int RngFrameIndexID = Shader.PropertyToID("_SSGIRngFrameIndex");
+        private static readonly int RngSeedID = Shader.PropertyToID("_SSGIRngSeed");
         private const string JitterKeyword = "_JITTER_ON";
         private const string HiZKeyword = "_SSGI_HIZ_ON";
+        private const string RngHashKeyword = "_SSGI_RNG_HASH";
 
         public ScreenSpaceGlobalIlluminationPass(SSGISettings settings)
         {
@@ -261,6 +454,17 @@ public class ScreenSpaceGlobalIlluminationFeature : ScriptableRendererFeature
             desc.msaaSamples = 1;
             desc.graphicsFormat = GraphicsFormat.R16G16B16A16_SFloat;
 
+            // Half-resolution descriptor used by every SSGI working texture
+            // when halfResolution is enabled. UVs are normalised so the half-res
+            // passes can still sample the full-res G-buffer/depth textures
+            // without any extra coordinate munging.
+            var traceDesc = desc;
+            if (settings.halfResolution)
+            {
+                traceDesc.width = Mathf.Max(1, desc.width / 2);
+                traceDesc.height = Mathf.Max(1, desc.height / 2);
+            }
+
             bool descriptorChanged = !state.descriptorValid || !state.descriptor.Equals(desc);
             if (descriptorChanged)
             {
@@ -270,13 +474,20 @@ public class ScreenSpaceGlobalIlluminationFeature : ScriptableRendererFeature
             }
 
             string suffix = cameraId.ToString();
-            RenderingUtils.ReAllocateIfNeeded(ref state.radianceRT, desc, FilterMode.Bilinear, TextureWrapMode.Clamp, name: "_SSGI_Radiance_" + suffix);
-            RenderingUtils.ReAllocateIfNeeded(ref state.blurA, desc, FilterMode.Bilinear, TextureWrapMode.Clamp, name: "_SSGI_BlurA_" + suffix);
-            RenderingUtils.ReAllocateIfNeeded(ref state.blurB, desc, FilterMode.Bilinear, TextureWrapMode.Clamp, name: "_SSGI_BlurB_" + suffix);
-            RenderingUtils.ReAllocateIfNeeded(ref state.historyA, desc, FilterMode.Bilinear, TextureWrapMode.Clamp, name: "_SSGI_HistoryA_" + suffix);
-            RenderingUtils.ReAllocateIfNeeded(ref state.historyB, desc, FilterMode.Bilinear, TextureWrapMode.Clamp, name: "_SSGI_HistoryB_" + suffix);
+            RenderingUtils.ReAllocateIfNeeded(ref state.radianceRT, traceDesc, FilterMode.Bilinear, TextureWrapMode.Clamp, name: "_SSGI_Radiance_" + suffix);
+            RenderingUtils.ReAllocateIfNeeded(ref state.currentIrradianceRT, traceDesc, FilterMode.Bilinear, TextureWrapMode.Clamp, name: "_SSGI_CurrentIrradiance_" + suffix);
+            RenderingUtils.ReAllocateIfNeeded(ref state.blurA, traceDesc, FilterMode.Bilinear, TextureWrapMode.Clamp, name: "_SSGI_BlurA_" + suffix);
+            RenderingUtils.ReAllocateIfNeeded(ref state.blurB, traceDesc, FilterMode.Bilinear, TextureWrapMode.Clamp, name: "_SSGI_BlurB_" + suffix);
+            RenderingUtils.ReAllocateIfNeeded(ref state.historyA, traceDesc, FilterMode.Bilinear, TextureWrapMode.Clamp, name: "_SSGI_HistoryA_" + suffix);
+            RenderingUtils.ReAllocateIfNeeded(ref state.historyB, traceDesc, FilterMode.Bilinear, TextureWrapMode.Clamp, name: "_SSGI_HistoryB_" + suffix);
 
-            RenderingUtils.ReAllocateIfNeeded(ref state.irradianceRT, desc, FilterMode.Bilinear, TextureWrapMode.Clamp, name: "_SSGI_Irradiance_" + suffix);
+            var sampleCountDesc = traceDesc;
+            sampleCountDesc.graphicsFormat = GraphicsFormat.R16_SFloat;
+            RenderingUtils.ReAllocateIfNeeded(ref state.historySampleA, sampleCountDesc, FilterMode.Point, TextureWrapMode.Clamp, name: "_SSGI_HistorySampleA_" + suffix);
+            RenderingUtils.ReAllocateIfNeeded(ref state.historySampleB, sampleCountDesc, FilterMode.Point, TextureWrapMode.Clamp, name: "_SSGI_HistorySampleB_" + suffix);
+
+            // applyRT is full resolution because Combine writes camera color.
+            RenderingUtils.ReAllocateIfNeeded(ref state.applyRT, desc, FilterMode.Bilinear, TextureWrapMode.Clamp, name: "_SSGI_Apply_" + suffix);
         }
 
         public void BindPreviousIrradiance(CommandBuffer cmd, ref RenderingData renderingData)
@@ -288,21 +499,15 @@ public class ScreenSpaceGlobalIlluminationFeature : ScriptableRendererFeature
                 return;
             }
 
-            bool configurationMatches = state.hasPreviousConfiguration &&
-                state.previousSettingsHash == ComputeSettingsHash(settings);
-            bool irradianceValid = state.historyValid && configurationMatches;
-            bool cameraMoved = state.hasPreviousPose &&
-                (state.previousPosition != cam.transform.position ||
-                 state.previousRotation != cam.transform.rotation ||
-                 state.previousProjectionMatrix != cam.nonJitteredProjectionMatrix);
-
-            cmd.SetGlobalFloat(IrradianceValidID, irradianceValid ? 1.0f : 0.0f);
-            cmd.SetGlobalFloat(ReprojectIrradianceID, cameraMoved ? 1.0f : 0.0f);
+            // Composite is the only place that applies indirect lighting.
+            // Clear the previous frame binding before opaque objects render so
+            // legacy object shaders cannot add the same irradiance a second time.
+            cmd.SetGlobalFloat(IrradianceValidID, 0.0f);
+            cmd.SetGlobalFloat(ReprojectIrradianceID, 0.0f);
             cmd.SetGlobalFloat(DisocclusionFallbackID,
                 IsFinite(settings.disocclusionFallback)
                     ? Mathf.Clamp01(settings.disocclusionFallback)
                     : 0.35f);
-            cmd.SetGlobalTexture(IrradianceTextureID, state.irradianceRT);
             cmd.SetGlobalFloat(HistoryDepthThresholdID,
                 IsFinite(settings.temporalDepthThreshold)
                     ? Mathf.Max(settings.temporalDepthThreshold, 0.001f)
@@ -336,14 +541,19 @@ public class ScreenSpaceGlobalIlluminationFeature : ScriptableRendererFeature
             Matrix4x4 currentViewProjectionMatrix =
                 renderingData.cameraData.GetGPUProjectionMatrixNoJitter() * currentWorldToCameraMatrix;
 
-            bool resetHistory = configurationChanged;
+            bool projectionChanged = state.hasPreviousPose &&
+                state.previousProjectionMatrix != projectionMatrix;
+            bool resetHistory = configurationChanged || projectionChanged;
             if (resetHistory)
                 ResetTemporalState(state);
-            else if (viewChanged && state.historyValid)
-                state.historyCount = Mathf.Min(
-                    state.historyCount, MotionHistoryFrameCap);
 
             bool accumulate = resetHistory || isNewLogicalFrame || viewChanged;
+            bool canUseHistory = accumulate && state.historyValid &&
+                !resetHistory;
+            // The temporal pass reprojects camera/object motion per pixel.
+            // Trace samples previous irradiance at the ray-hit UV directly,
+            // so disable only that multi-bounce lookup while the view moves.
+            bool canUsePreviousIrradiance = canUseHistory && !viewChanged;
             if (accumulate)
             {
                 if (!resetHistory && state.historyValid)
@@ -372,12 +582,18 @@ public class ScreenSpaceGlobalIlluminationFeature : ScriptableRendererFeature
                     : 1.5f;
                 float temporalResponse = IsFinite(settings.temporalResponse)
                     ? Mathf.Clamp(settings.temporalResponse, 0.001f, 1.0f)
-                    : 0.05f;
+                    : 0.08f;
+                float temporalHistoryWeight = 1.0f - temporalResponse;
+                int maxHistoryFrames = Mathf.Clamp(settings.maxHistoryFrames, 2, 2048);
                 float temporalDepthThreshold = IsFinite(settings.temporalDepthThreshold)
                     ? Mathf.Max(settings.temporalDepthThreshold, 0.001f)
                     : 0.1f;
-                int maxHistoryFrames = Mathf.Clamp(settings.maxHistoryFrames, 2, 512);
-
+                int traceWidth = state.blurA != null && state.blurA.rt != null
+                    ? state.blurA.rt.width
+                    : Mathf.Max(1, state.descriptor.width / (settings.halfResolution ? 2 : 1));
+                int traceHeight = state.blurA != null && state.blurA.rt != null
+                    ? state.blurA.rt.height
+                    : Mathf.Max(1, state.descriptor.height / (settings.halfResolution ? 2 : 1));
                 material.SetVector(UVToViewPosID, GIUtility.ComputeUVToViewPos(cam));
                 material.SetInt(RayCountID, rayCount);
                 material.SetInt(SampleOffsetID, state.sampleOffset);
@@ -388,10 +604,14 @@ public class ScreenSpaceGlobalIlluminationFeature : ScriptableRendererFeature
                 material.SetFloat(IntensityID, intensity);
                 material.SetFloat(BlurSpreadID, blurSpread);
                 material.SetFloat(HistoryDepthThresholdID, temporalDepthThreshold);
-                material.SetFloat(MaxHistoryFramesID, maxHistoryFrames);
-                material.SetFloat(HistoryFrameCountID,
-                    Mathf.Min(state.historyCount, maxHistoryFrames));
+                material.SetInt(MaxHistoryFramesID, maxHistoryFrames);
                 material.SetMatrix(PreviousWorldToCameraMatrixID, state.previousWorldToCameraMatrix);
+                material.SetVector(TraceSizeID, new Vector4(
+                    traceWidth,
+                    traceHeight,
+                    1.0f / Mathf.Max(1, traceWidth),
+                    1.0f / Mathf.Max(1, traceHeight)));
+                material.SetFloat(HalfResolutionID, settings.halfResolution ? 1.0f : 0.0f);
 
                 if (settings.jitterDither)
                     material.EnableKeyword(JitterKeyword);
@@ -403,23 +623,77 @@ public class ScreenSpaceGlobalIlluminationFeature : ScriptableRendererFeature
                 else
                     material.DisableKeyword(HiZKeyword);
 
+                if (settings.rngMode == SSGIRngMode.Hash)
+                    material.EnableKeyword(RngHashKeyword);
+                else
+                    material.DisableKeyword(RngHashKeyword);
+
+                material.SetInt(RngFrameIndexID, Mathf.Max(0, Time.frameCount & 0xFFFF));
+                material.SetInt(RngSeedID, 0);
+
+                // Keep a half-resolution copy of the current camera color. It
+                // bootstraps the first frame and every frame where camera
+                // motion makes the previous irradiance invalid.
                 Blitter.BlitCameraTexture(cmd, sourceHandle, state.radianceRT);
                 cmd.SetGlobalTexture(RadianceTextureID, state.radianceRT);
 
                 if (accumulate)
                 {
-                    cmd.SetGlobalTexture(HistoryTextureID, state.HistoryRead);
-                    material.SetFloat(HistoryValidID, state.historyValid ? 1.0f : 0.0f);
-                    material.SetFloat(HistoryWeightID, temporalResponse);
+                    RTHandle previousIrradiance = canUsePreviousIrradiance
+                        ? state.HistoryRead
+                        : state.radianceRT;
 
-                    Blitter.BlitCameraTexture(cmd, sourceHandle, state.blurA, material, 0);
-                    Blitter.BlitCameraTexture(cmd, state.blurA, state.HistoryWrite, material, 3);
-                    Blitter.BlitCameraTexture(cmd, state.HistoryWrite, state.blurB, material, 1);
-                    Blitter.BlitCameraTexture(cmd, state.blurB, state.irradianceRT, material, 2);
+                    // Pass 0 samples this texture at the ray hit. The first
+                    // valid frame uses Camera Color; subsequent stationary
+                    // frames use the accumulated irradiance history.
+                    cmd.SetGlobalTexture(IrradianceTextureID, previousIrradiance);
+                    cmd.SetGlobalTexture(HistoryTextureID, state.HistoryRead);
+                    cmd.SetGlobalTexture(
+                        HistorySampleTextureID, state.HistorySampleRead);
+                    material.SetFloat(
+                        PreviousIrradianceValidID,
+                        canUsePreviousIrradiance ? 1.0f : 0.0f);
+                    material.SetFloat(HistoryValidID, canUseHistory ? 1.0f : 0.0f);
+                    material.SetFloat(HistoryWeightID, temporalHistoryWeight);
+
+                    // SSGI -> Accumulate -> sample count -> BlurH -> BlurV.
+                    // Irradiance and per-pixel sample-count histories swap in
+                    // lockstep after all commands have been submitted.
+                    Blitter.BlitCameraTexture(
+                        cmd, previousIrradiance, state.currentIrradianceRT, material, 0);
+                    Blitter.BlitCameraTexture(
+                        cmd, state.currentIrradianceRT, state.blurA, material, 3);
+                    Blitter.BlitCameraTexture(
+                        cmd, state.currentIrradianceRT, state.HistorySampleWrite, material, 4);
+                    cmd.SetGlobalTexture(
+                        HistorySampleTextureID, state.HistorySampleWrite);
+                    Blitter.BlitCameraTexture(cmd, state.blurA, state.blurB, material, 1);
+                    Blitter.BlitCameraTexture(cmd, state.blurB, state.HistoryWrite, material, 2);
                 }
 
-                cmd.SetGlobalTexture(IrradianceTextureID, state.irradianceRT);
+                RTHandle currentIrradiance = accumulate
+                    ? state.HistoryWrite
+                    : state.HistoryRead;
+                cmd.SetGlobalTexture(IrradianceTextureID, currentIrradiance);
                 cmd.SetGlobalFloat(IrradianceValidID, state.historyValid || accumulate ? 1.0f : 0.0f);
+
+                if (intensity > 0.0f
+                    && (state.historyValid || accumulate)
+                    && currentIrradiance != null && currentIrradiance.rt != null)
+                {
+                    int irradianceWidth = currentIrradiance.rt.width;
+                    int irradianceHeight = currentIrradiance.rt.height;
+                    material.SetVector(IrradianceTexelSizeID, new Vector4(
+                        1.0f / Mathf.Max(1, irradianceWidth),
+                        1.0f / Mathf.Max(1, irradianceHeight),
+                        irradianceWidth,
+                        irradianceHeight));
+
+                    // Combine camera color and indirect diffuse into applyRT.
+                    Blitter.BlitCameraTexture(cmd, sourceHandle, state.applyRT, material, 5);
+
+                    Blitter.BlitCameraTexture(cmd, state.applyRT, sourceHandle);
+                }
             }
 
             context.ExecuteCommandBuffer(cmd);
@@ -428,8 +702,6 @@ public class ScreenSpaceGlobalIlluminationFeature : ScriptableRendererFeature
             if (accumulate)
             {
                 state.historyReadIndex = 1 - state.historyReadIndex;
-                if (state.historyCount < int.MaxValue)
-                    state.historyCount++;
                 state.historyValid = true;
                 state.hasPreviousPose = true;
                 state.previousPosition = cam.transform.position;
@@ -448,7 +720,6 @@ public class ScreenSpaceGlobalIlluminationFeature : ScriptableRendererFeature
             state.hasPreviousPose = false;
             state.hasPreviousConfiguration = false;
             state.historyValid = false;
-            state.historyCount = 0;
             state.sampleOffset = 0;
             state.lastUpdateFrame = -1;
             state.historyReadIndex = 0;
@@ -514,8 +785,10 @@ public class ScreenSpaceGlobalIlluminationFeature : ScriptableRendererFeature
                 hash = hash * 31 + value.blurSpread.GetHashCode();
                 hash = hash * 31 + (value.jitterDither ? 1 : 0);
                 hash = hash * 31 + value.temporalResponse.GetHashCode();
-                hash = hash * 31 + value.temporalDepthThreshold.GetHashCode();
                 hash = hash * 31 + value.maxHistoryFrames;
+                hash = hash * 31 + value.temporalDepthThreshold.GetHashCode();
+                hash = hash * 31 + (value.halfResolution ? 1 : 0);
+                hash = hash * 31 + (int)value.rngMode;
                 return hash;
             }
         }
