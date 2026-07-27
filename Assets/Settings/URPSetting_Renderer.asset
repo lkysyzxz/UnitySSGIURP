@@ -99,11 +99,11 @@ MonoBehaviour:
     thickness: 1
     originBias: 0
     useHiZTracing: 0
-    intensity: 1
-    blurSpread: 1
+    intensity: 1.2
+    blurSpread: 0.2
     jitterDither: 1
     temporalResponse: 0.005
-    maxHistoryFrames: 32
+    maxHistoryFrames: 64
     temporalDepthThreshold: 0.01
     disocclusionFallback: 0.036
     halfResolution: 1

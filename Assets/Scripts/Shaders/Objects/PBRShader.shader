@@ -2,9 +2,13 @@ Shader "GIDev/URP/PBR"
 {
     Properties
     {
+        [MainTexture] _BaseColorMap ("Albedo Map", 2D) = "white" {}
         [MainColor] _BaseColor ("Albedo", Color) = (1, 1, 1, 1)
         _Roughness ("Roughness", Range(0, 1)) = 0.5
         _Metallic ("Metallic", Range(0, 1)) = 0.0
+        [Toggle(_ALPHATEST_ON)] _AlphaCutoffEnable ("Alpha Clipping", Float) = 0.0
+        _Cutoff ("Alpha Cutoff", Range(0, 1)) = 0.5
+        [Enum(UnityEngine.Rendering.CullMode)] _CullMode ("Cull Mode", Float) = 2.0
     }
 
     SubShader
@@ -22,16 +26,23 @@ Shader "GIDev/URP/PBR"
         #include "Packages/com.unity.render-pipelines.universal/ShaderLibrary/Lighting.hlsl"
         #include "Packages/com.unity.render-pipelines.core/ShaderLibrary/Color.hlsl"
 
+        TEXTURE2D(_BaseColorMap);
+        SAMPLER(sampler_BaseColorMap);
+
         CBUFFER_START(UnityPerMaterial)
             half4 _BaseColor;
+            float4 _BaseColorMap_ST;
             half _Roughness;
             half _Metallic;
+            half _AlphaCutoffEnable;
+            half _Cutoff;
         CBUFFER_END
 
         struct Attributes
         {
             float4 positionOS : POSITION;
             float3 normalOS : NORMAL;
+            float2 uv : TEXCOORD0;
             UNITY_VERTEX_INPUT_INSTANCE_ID
         };
 
@@ -40,6 +51,7 @@ Shader "GIDev/URP/PBR"
             float4 positionCS : SV_POSITION;
             float3 positionWS : TEXCOORD0;
             half3 normalWS : TEXCOORD1;
+            float2 uv : TEXCOORD2;
             UNITY_VERTEX_INPUT_INSTANCE_ID
             UNITY_VERTEX_OUTPUT_STEREO
         };
@@ -56,20 +68,33 @@ Shader "GIDev/URP/PBR"
             output.positionCS = positionInputs.positionCS;
             output.positionWS = positionInputs.positionWS;
             output.normalWS = normalInputs.normalWS;
+            output.uv = TRANSFORM_TEX(input.uv, _BaseColorMap);
             return output;
         }
 
-        void InitializePBRSurfaceData(out SurfaceData surfaceData)
+        half4 SampleBaseColor(float2 uv)
+        {
+            return SAMPLE_TEXTURE2D(_BaseColorMap, sampler_BaseColorMap, uv) * _BaseColor;
+        }
+
+        void ApplyAlphaClip(half alpha)
+        {
+            #if defined(_ALPHATEST_ON)
+                clip(alpha - _Cutoff);
+            #endif
+        }
+
+        void InitializePBRSurfaceData(half4 baseColor, out SurfaceData surfaceData)
         {
             surfaceData = (SurfaceData)0;
-            surfaceData.albedo = _BaseColor.rgb;
+            surfaceData.albedo = baseColor.rgb;
             surfaceData.metallic = saturate(_Metallic);
             surfaceData.specular = half3(0.0h, 0.0h, 0.0h);
             surfaceData.smoothness = 1.0h - saturate(_Roughness);
             surfaceData.normalTS = half3(0.0h, 0.0h, 1.0h);
             surfaceData.emission = half3(0.0h, 0.0h, 0.0h);
             surfaceData.occlusion = 1.0h;
-            surfaceData.alpha = _BaseColor.a;
+            surfaceData.alpha = baseColor.a;
             surfaceData.clearCoatMask = 0.0h;
             surfaceData.clearCoatSmoothness = 0.0h;
         }
@@ -171,8 +196,11 @@ Shader "GIDev/URP/PBR"
             UNITY_SETUP_INSTANCE_ID(input);
             UNITY_SETUP_STEREO_EYE_INDEX_POST_VERTEX(input);
 
+            half4 baseColor = SampleBaseColor(input.uv);
+            ApplyAlphaClip(baseColor.a);
+
             SurfaceData surfaceData;
-            InitializePBRSurfaceData(surfaceData);
+            InitializePBRSurfaceData(baseColor, surfaceData);
 
             InputData inputData;
             InitializePBRInputData(input, inputData);
@@ -193,8 +221,11 @@ Shader "GIDev/URP/PBR"
             UNITY_SETUP_INSTANCE_ID(input);
             UNITY_SETUP_STEREO_EYE_INDEX_POST_VERTEX(input);
 
+            half4 baseColor = SampleBaseColor(input.uv);
+            ApplyAlphaClip(baseColor.a);
+
             ForwardGBufferOutput output;
-            output.albedo = _BaseColor;
+            output.albedo = baseColor;
             output.material = half4(saturate(_Metallic), saturate(_Roughness), 0.0h, 1.0h);
             output.normalWS = half4(NormalizeNormalPerPixel(input.normalWS), 1.0h);
             output.positionWS = float4(input.positionWS, 1.0);
@@ -207,7 +238,7 @@ Shader "GIDev/URP/PBR"
             Name "ForwardLit"
             Tags { "LightMode" = "UniversalForward" }
 
-            Cull Back
+            Cull [_CullMode]
             ZWrite On
             ZTest LEqual
 
@@ -215,6 +246,8 @@ Shader "GIDev/URP/PBR"
             #pragma target 3.5
             #pragma vertex LitVertex
             #pragma fragment LitFragment
+
+            #pragma shader_feature_local_fragment _ALPHATEST_ON
 
             #pragma multi_compile _ _MAIN_LIGHT_SHADOWS _MAIN_LIGHT_SHADOWS_CASCADE _MAIN_LIGHT_SHADOWS_SCREEN
             #pragma multi_compile _ _ADDITIONAL_LIGHTS_VERTEX _ADDITIONAL_LIGHTS
@@ -231,7 +264,7 @@ Shader "GIDev/URP/PBR"
             Name "ForwardGBuffer"
             Tags { "LightMode" = "SSGIForwardGBuffer" }
 
-            Cull Back
+            Cull [_CullMode]
             // ForwardGBufferPass overrides this to ZWrite Off + Equal when it
             // reuses camera depth, and to ZWrite On + LEqual for its fallback
             // depth target. Keep the shader's standalone state compatible with
@@ -243,6 +276,7 @@ Shader "GIDev/URP/PBR"
             #pragma target 4.5
             #pragma vertex LitVertex
             #pragma fragment ForwardGBufferFragment
+            #pragma shader_feature_local_fragment _ALPHATEST_ON
             #pragma multi_compile_instancing
             ENDHLSL
         }
@@ -255,12 +289,13 @@ Shader "GIDev/URP/PBR"
             ZWrite On
             ZTest LEqual
             ColorMask 0
-            Cull Back
+            Cull [_CullMode]
 
             HLSLPROGRAM
             #pragma target 3.5
             #pragma vertex ShadowVertex
             #pragma fragment ShadowFragment
+            #pragma shader_feature_local_fragment _ALPHATEST_ON
             #pragma multi_compile_vertex _ _CASTING_PUNCTUAL_LIGHT_SHADOW
             #pragma multi_compile_instancing
 
@@ -272,6 +307,7 @@ Shader "GIDev/URP/PBR"
             struct ShadowVaryings
             {
                 float4 positionCS : SV_POSITION;
+                float2 uv : TEXCOORD0;
                 UNITY_VERTEX_INPUT_INSTANCE_ID
                 UNITY_VERTEX_OUTPUT_STEREO
             };
@@ -301,12 +337,15 @@ Shader "GIDev/URP/PBR"
                     output.positionCS.z = max(output.positionCS.z, UNITY_NEAR_CLIP_VALUE);
                 #endif
 
+                output.uv = TRANSFORM_TEX(input.uv, _BaseColorMap);
+
                 return output;
             }
 
             half4 ShadowFragment(ShadowVaryings input) : SV_Target
             {
                 UNITY_SETUP_INSTANCE_ID(input);
+                ApplyAlphaClip(SampleBaseColor(input.uv).a);
                 return 0.0h;
             }
             ENDHLSL

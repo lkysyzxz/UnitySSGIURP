@@ -920,10 +920,12 @@ public class SSGIRefactorTests
     {
         string shader = ReadAsset("Scripts", "Shaders", "Objects", "PBRShader.shader");
 
+        Assert.That(shader, Does.Match(@"_BaseColorMap\s*\(\s*""Albedo Map""\s*,\s*2D\s*\)"));
         Assert.That(shader, Does.Match(@"_BaseColor\s*\(\s*""Albedo""\s*,\s*Color\s*\)"));
         Assert.That(shader, Does.Match(@"_Roughness\s*\(\s*""Roughness""\s*,\s*Range\s*\(\s*0\s*,\s*1\s*\)\s*\)"));
         Assert.That(shader, Does.Match(@"_Metallic\s*\(\s*""Metallic""\s*,\s*Range\s*\(\s*0\s*,\s*1\s*\)\s*\)"));
-        Assert.That(shader, Does.Match(@"surfaceData\.albedo\s*=\s*_BaseColor\.rgb"));
+        Assert.That(shader, Does.Match(@"SAMPLE_TEXTURE2D\s*\(\s*_BaseColorMap\s*,\s*sampler_BaseColorMap\s*,\s*uv\s*\)\s*\*\s*_BaseColor"));
+        Assert.That(shader, Does.Match(@"surfaceData\.albedo\s*=\s*baseColor\.rgb"));
         Assert.That(shader, Does.Match(@"surfaceData\.metallic\s*=\s*saturate\s*\(\s*_Metallic\s*\)"));
         Assert.That(shader, Does.Match(@"surfaceData\.smoothness\s*=\s*1\.0h\s*-\s*saturate\s*\(\s*_Roughness\s*\)"));
         Assert.That(shader, Does.Contain("InitializeBRDFData(surfaceData, brdfData)"));
@@ -941,7 +943,33 @@ public class SSGIRefactorTests
         Assert.That(shader, Does.Contain("_MAIN_LIGHT_SHADOWS"));
         Assert.That(shader, Does.Contain("_ADDITIONAL_LIGHT_SHADOWS"));
         Assert.That(shader, Does.Contain("ApplyShadowBias"));
+        Assert.That(shader, Does.Contain("ApplyAlphaClip(SampleBaseColor(input.uv).a)"));
+        Assert.That(shader, Does.Match(@"Cull\s*\[\s*_CullMode\s*\]"));
         Assert.That(shader, Does.Not.Match(@"pow\s*\(\s*color\s*,\s*2\.2"));
+    }
+
+    [Test]
+    public void SponzaMaterials_UsePBRShaderAndPreserveLayerZeroAlbedoMaps()
+    {
+        const string pbrShaderGuid = "b8f71ddc42f44b8797fb86c5ce344f86";
+        string materialsPath = ProjectPath("SponzaHDRP", "Art", "Sponza", "Materials");
+        string[] materialPaths = Directory.GetFiles(materialsPath, "*.mat", SearchOption.TopDirectoryOnly);
+
+        Assert.That(materialPaths, Has.Length.EqualTo(33));
+        foreach (string materialPath in materialPaths)
+        {
+            string material = File.ReadAllText(materialPath);
+            Assert.That(material, Does.Match($@"m_Shader:.*guid:\s*{pbrShaderGuid}"), Path.GetFileName(materialPath));
+
+            if (!Path.GetFileNameWithoutExtension(materialPath).Contains("Layered"))
+                continue;
+
+            Match baseMap = Regex.Match(material, @"- _BaseColorMap:\s*\r?\n\s*m_Texture:.*guid:\s*([0-9a-f]+)");
+            Match layerZeroMap = Regex.Match(material, @"- _BaseColorMap0:\s*\r?\n\s*m_Texture:.*guid:\s*([0-9a-f]+)");
+            Assert.That(baseMap.Success, Is.True, Path.GetFileName(materialPath));
+            Assert.That(layerZeroMap.Success, Is.True, Path.GetFileName(materialPath));
+            Assert.That(baseMap.Groups[1].Value, Is.EqualTo(layerZeroMap.Groups[1].Value), Path.GetFileName(materialPath));
+        }
     }
 
     [Test]
