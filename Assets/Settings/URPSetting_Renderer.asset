@@ -100,13 +100,13 @@ MonoBehaviour:
     originBias: 0
     useHiZTracing: 0
     intensity: 1
-    blurSpread: 0
-    jitterDither: 0
-    temporalResponse: 0.001
-    maxHistoryFrames: 128
+    blurSpread: 1
+    jitterDither: 1
+    temporalResponse: 0.005
+    maxHistoryFrames: 32
     temporalDepthThreshold: 0.01
-    disocclusionFallback: 0.01
-    halfResolution: 0
+    disocclusionFallback: 0.036
+    halfResolution: 1
     rngMode: 0
   ssgiShader: {fileID: 4800000, guid: 9490a711bfc34f8cbeef660f439b2d0e, type: 3}
 --- !u!114 &8235197496059556877

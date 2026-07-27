@@ -304,7 +304,7 @@ Shader "Hidden/SSGI/ScreenSpaceGlobalIllumination"
                 float historyWeight = temporal.sampleCount >= maxHistoryFrames
                     ? saturate(_SSGIHistoryWeight)
                     : temporal.sampleCount / nextSampleCount;
-                float currentFrameWeight = temporal.sampleCount >= maxHistoryFrames ? 1.0 - historyWeight:1.0f/nextSampleCount;
+                float currentFrameWeight = 1.0 - historyWeight;
                 float3 accumulated =
                     temporal.irradianceDepth.rgb * historyWeight +
                     current.rgb * currentFrameWeight;
