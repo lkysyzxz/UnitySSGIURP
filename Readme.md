@@ -30,3 +30,5 @@
 使用对应 Unity 版本打开工程，然后运行 `Assets/Scenes/SSGIScene.unity` 即可查看效果。Renderer Feature 的采样数量、光线步数、最大距离、时间累积、模糊范围和半分辨率选项可在 URP Renderer Asset 中调整。
 
 > 本工程用于实时渲染技术实验。SSGI 依赖当前屏幕中的深度、法线和颜色信息，屏幕外光源或遮挡物不会参与计算。
+
+![SSGI Sponza](ReadmeImgs/image-20260729021256545.png)
